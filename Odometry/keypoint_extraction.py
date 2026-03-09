@@ -108,6 +108,41 @@ def extract_keypoints(H, S, l_max = 500, return_mask = False):
     
     return keypoints
 
+def k_strongest_keypoints(img, z_min, k=12):
+    """
+    Extract keypoints, by selecting the k strongest readings per azimuth that exceed a specified intensity threshold z_min.
+    """
+    keypoints = []
+    for a in range(img.shape[0]):
+        # Get the indices of the k strongest readings for this angle
+        strongest_indices = np.argsort(img[a, :])[-k:]
+        
+        # Filter out readings that do not exceed the intensity threshold
+        valid_indices = [r for r in strongest_indices if img[a, r] > z_min]
+        
+        # Add valid keypoints to the list
+        for r in valid_indices:
+            keypoints.append((a, r))
+    
+    return np.array(keypoints)
+
+def motion_compensation(keypoints, ego_motion):
+    """Apply motion compensation to keypoints based on ego-motion data.
+    Assume that there is no acceleration.
+    ego_motion = (v_x, v_y, theta) - velocity in x and y direction and angular velocity"""
+    angle_resolution = 400 # 400 azimuth bins
+    delta_T = 0.5 #s - time for a full radar scan
+
+    time_offset = (keypoints[:, 0] - angle_resolution/2)*delta_T/2
+
+    R = np.array([[np.cos(-ego_motion[2]), -np.sin(-ego_motion[2])],
+                  [np.sin(-ego_motion[2]), np.cos(-ego_motion[2])]])
+    trans = np.array([ego_motion[0], ego_motion[1]])
+    
+    compensated_keypoints = R @ keypoints - time_offset*trans
+
+    return compensated_keypoints
+
 def visualize_kp_pipeline(img, keypoints, mask):
     H, S, gradient = compute_H_S(img, True)
 
@@ -153,7 +188,6 @@ def visualize_kp_pipeline(img, keypoints, mask):
 
     plt.show()
 
-
 def visualize_keypoints(img_polar, img_cartesian, keypoints, max_range=1.0):
     num_angles, num_ranges = img_polar.shape
 
@@ -186,6 +220,29 @@ def visualize_keypoints(img_polar, img_cartesian, keypoints, max_range=1.0):
     plt.tight_layout()
     plt.show()
 
+def compare_keypoint_methods(img):
+    S, H = compute_H_S(img)
+    keypoints_HS = extract_keypoints(H, S, l_max=500)
+    keypoints_kstrongest = k_strongest_keypoints(img, z_min=0.6, k=12)
+
+    plt.figure(figsize=(12, 6))
+    plt.subplot(1, 2, 1)
+    plt.imshow(img, aspect='auto')
+    plt.scatter(keypoints_HS[:, 1], keypoints_HS[:, 0], c='red', s=20, marker='x')
+    plt.title("Keypoints from H-S Method")
+    plt.xlabel("Range")
+    plt.ylabel("Angle")
+
+    plt.subplot(1, 2, 2)
+    plt.imshow(img, aspect='auto')
+    plt.scatter(keypoints_kstrongest[:, 1], keypoints_kstrongest[:, 0], c='blue', s=20, marker='o')
+    plt.title("Keypoints from K-Strongest Method")
+    plt.xlabel("Range")
+    plt.ylabel("Angle")
+
+    plt.tight_layout()
+    plt.show()
+
 if __name__ == "__main__":
     # Load radar image 
     image_file, image = load_radar_images(num_images=1)
@@ -199,3 +256,4 @@ if __name__ == "__main__":
     
     #visualize_keypoints(img, cartesian_image, keypoints)
     visualize_kp_pipeline(img, keypoints, mask)
+    compare_keypoint_methods(img)

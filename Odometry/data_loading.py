@@ -18,9 +18,13 @@ def polar_to_cartesian_points(ranges, angles):
     Returns:
     - points: Nx2 array of Cartesian coordinates (x, y)
     """
-    x = ranges * np.cos(angles)
-    y = ranges * np.sin(angles)
+    range_resolution = 0.155 #m
+    angle_resolution = 2*np.pi/400 # 400 azimuth bins
+
+    x = ranges * range_resolution* np.cos(angles*angle_resolution)
+    y = ranges * range_resolution * np.sin(angles*angle_resolution)
     points = np.stack((x, y), axis=-1)
+    
     return points
 
 def polar_to_cartesian_image(image, size=1024, max_range=1.0):
