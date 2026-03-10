@@ -4,40 +4,24 @@ import pandas as pd
 import os
 import matplotlib.pyplot as plt
 
+# Folder and file paths to the radar images and GPS data
 FOLDER_PATH = r"C:\Users\leona\Documents\Masterstudium\Special Course - Object Detection\Data\decoded\_radar_data_b_scan_image"
 CSV_FILE_PATH = r"C:\Users\leona\Documents\Masterstudium\Special Course - Object Detection\Data\decoded\snowborbus_gps_data.csv"
 
-def polar_to_cartesian_points(ranges, angles):
+# Transformation functions for radar data
+def polar_to_cartesian_points(ranges, angles, range_resolution = 0.155, angle_resolution = 2*np.pi/400):
     """
-    Convert polar coordinates (ranges and angles) to Cartesian coordinates (x, y).
-    
-    Parameters:
-    - ranges: Array of range measurements (distance from radar)
-    - angles: Array of angle measurements (bearing from radar)
-    
-    Returns:
-    - points: Nx2 array of Cartesian coordinates (x, y)
+    Convert polar coordinates (ranges and angles) to Cartesian coordinates (x, y) and scaling them according to the resolution.
     """
-    range_resolution = 0.155 #m
-    angle_resolution = 2*np.pi/400 # 400 azimuth bins
-
     x = ranges * range_resolution* np.cos(angles*angle_resolution)
     y = ranges * range_resolution * np.sin(angles*angle_resolution)
     points = np.stack((x, y), axis=-1)
-    
+
     return points
 
 def polar_to_cartesian_image(image, size=1024, max_range=1.0):
     """
     Convert a radar image in polar coordinates to Cartesian coordinates.
-    
-    Parameters:
-    - image: 2D array with shape (num_angles, num_ranges)
-    - size: Output Cartesian image size in pixels
-    - max_range: Maximum range in normalized units (0 to 1)
-    
-    Returns:
-    - cartesian_image: 2D array in Cartesian coordinates
     """
     num_angles, num_ranges = image.shape[:2]
     
@@ -64,6 +48,7 @@ def polar_to_cartesian_image(image, size=1024, max_range=1.0):
     
     return img_cartesian
 
+# Function to extract timestamp from filename
 def extract_timestamp(filename):
     """Extract timestamp from filename in the format: radar_YYYY-MM-DD_HH-MM-SS_ms.png"""
     parts = filename.split('_')
@@ -73,6 +58,7 @@ def extract_timestamp(filename):
     ms = parts[3].replace('.png', '')  # ms
     return f"{date}T{time}.{ms}"
 
+# Load functions for radar images and GPS data
 def load_radar_images(num_images = 5,folder_path = FOLDER_PATH):
     # List all PNG files in the folder and sort them by timestamp
     image_files = sorted([f for f in os.listdir(folder_path) if f.endswith('.png')], key=extract_timestamp)
@@ -89,6 +75,9 @@ def load_gps_data(csv_file_path = CSV_FILE_PATH):
     gps_data = pd.read_csv(csv_file_path)
     gps_data['time-string'] = pd.to_datetime(gps_data['time-string'])
     return gps_data
+
+# Add function which corrects the blank space in radar images 
+
 
 if __name__ == "__main__":
     # Load radar image 
