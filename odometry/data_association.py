@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.sparse.linalg import eigs
 
-from data_loading import load_radar_images, polar_to_cartesian_image, polar_to_cartesian_points
+from utils.data_loading import load_radar_images, polar_to_cartesian_image, polar_to_cartesian_points
 from keypoint_extraction import compute_H_S, extract_keypoints, visualize_keypoints
 
 def compute_descriptors(img, keypoints, alpha=18, rho=10, max_radius=50):
