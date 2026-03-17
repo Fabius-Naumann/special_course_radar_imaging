@@ -5,7 +5,7 @@ from scipy.signal import convolve
 from scipy.stats import norm
 import cv2
 
-from data_loading import load_radar_images, polar_to_cartesian_image, polar_to_cartesian_points
+from utils.data_loading import load_radar_images, polar_to_cartesian_image, polar_to_cartesian_points
 
 def compute_H_S(img, return_mag = False):
     # Compute the gradient using the Prewitt operator in both directions

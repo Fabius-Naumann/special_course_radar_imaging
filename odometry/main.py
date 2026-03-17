@@ -1,4 +1,4 @@
-from data_loading import load_radar_images, load_gps_data, extract_timestamp
+from utils.data_loading import load_radar_images, load_gps_data, extract_timestamp
 from keypoint_extraction import compute_H_S, Cen2019_keypoints, k_strongest_keypoints
 from descriptors import compute_descriptors, estimate_oriented_surface_points, orb_descriptor, radial_statistics_descriptor
 from data_association import (
@@ -26,6 +26,7 @@ DESCRIPTOR_TYPE = "cen2019"  # Options: "cen2019", "orb", "radial"
 KEYPOINT_TYPE = "cen2019"  # Options: "cen2019", "k_strongest", "blob", "orb"
 
 
+#TODO: Change into notbook and clean up code structure
 def build_descriptors(img, keypoints, descriptor_type):
     """
     Build descriptors for keypoints and return aligned (keypoints, descriptors).

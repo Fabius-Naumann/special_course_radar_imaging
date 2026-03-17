@@ -1,0 +1,6 @@
+# generated stuff
+**/__pycache__/**
+
+# own folders
+data/**
+results/**

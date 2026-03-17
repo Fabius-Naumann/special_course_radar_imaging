@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 from scipy.sparse.linalg import eigs
 import open3d as o3d
 
-from data_loading import load_radar_images, polar_to_cartesian_image, polar_to_cartesian_points
+from utils.data_loading import load_radar_images, polar_to_cartesian_image, polar_to_cartesian_points
 from keypoint_extraction import compute_H_S, Cen2019_keypoints, visualize_keypoints
 from descriptors import compute_descriptors
 
@@ -518,8 +518,8 @@ if __name__ == "__main__":
     img1 = image[0]
     img2 = image[1]
     
-    cartesian_image1 = polar_to_cartesian_image(img1)
-    cartesian_image2 = polar_to_cartesian_image(img2)
+    cartesian_image1, _, _ = polar_to_cartesian_image(img1)
+    cartesian_image2, _, _ = polar_to_cartesian_image(img2)
     
     S1, H1 = compute_H_S(img1)
     S2, H2 = compute_H_S(img2)

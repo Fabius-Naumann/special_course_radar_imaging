@@ -1,7 +1,7 @@
 import numpy as np
 import cv2
 
-from data_loading import polar_to_cartesian_points
+from utils.data_loading import polar_to_cartesian_points
 
 def compute_descriptors(img, keypoints, alpha=18, rho=10, max_radius=50):
     """

@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import folium
 from scipy.ndimage import shift, rotate
 
-from data_loading import extract_timestamp, load_gps_data, load_radar_images, polar_to_cartesian_image
+from utils.data_loading import extract_timestamp, load_gps_data, load_radar_images, polar_to_cartesian_image
 from keypoint_extraction import Cen2019_keypoints, compute_H_S
 from data_association import compute_descriptors, unaryMatchesFromDescriptors, compute_pairwiseCompatibilityScore, select_matches
 from motion_estimation import motion_estimation_ransac, motion_estimation_SVD
@@ -99,8 +99,8 @@ def visualize_transformed_overlay(img1, img2, theta_deg, translation):
     - translation: Estimated translation vector [tx, ty] in meters
     """
     # Convert images to Cartesian coordinates
-    cart_img1 = polar_to_cartesian_image(img1)
-    cart_img2 = polar_to_cartesian_image(img2)
+    cart_img1, _, _ = polar_to_cartesian_image(img1)
+    cart_img2, _, _ = polar_to_cartesian_image(img2)
     
     # Convert translation from meters to pixels
     # Estimate pixel scaling (this is approximate based on image size and range)
@@ -633,8 +633,8 @@ if __name__ == "__main__":
     print(f"Timestamp for Image 1: {timestamp1}")
     print(f"Timestamp for Image 2: {timestamp2}")
     
-    cartesian_image1 = polar_to_cartesian_image(img1)
-    cartesian_image2 = polar_to_cartesian_image(img2)
+    cartesian_image1, _, _ = polar_to_cartesian_image(img1)
+    cartesian_image2, _, _ = polar_to_cartesian_image(img2)
     
     S1, H1 = compute_H_S(img1)
     S2, H2 = compute_H_S(img2)
