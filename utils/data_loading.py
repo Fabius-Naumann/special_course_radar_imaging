@@ -102,6 +102,65 @@ def polar_to_cartesian_image(data, theta_range=None, r_range=(0, 1000), grid_siz
     return sampled.astype(np.float32), x, y
 
 
+def cartesian_to_polar_image(cart_data, polar_shape, theta_range=None, r_range=None):
+    """
+    Convert a radar image from Cartesian to polar coordinates.
+
+    Parameters:
+    -----------
+    cart_data : ndarray
+        2D array in Cartesian format (grid_size x grid_size)
+    polar_shape : tuple
+        (n_range, n_azimuth) dimensions of the target polar image
+    theta_range : tuple, optional
+        (min_angle, max_angle) in radians
+    r_range : tuple, optional
+        (min_range, max_range) in meters/samples
+
+    Returns:
+    --------
+    polar_data : ndarray
+        2D array in polar format (n_range x n_azimuth)
+    """
+    n_range, n_azimuth = polar_shape
+    grid_size = cart_data.shape[0]
+
+    if theta_range is None:
+        theta_range = (0, 2 * np.pi)
+    if r_range is None:
+        r_range = (0, n_range - 1)
+
+    r_min, r_max = r_range
+    theta_min, theta_max = theta_range
+
+    r_polar = np.linspace(r_min, r_max, n_range, dtype=np.float32)
+
+    # Calculate azimuth angles
+    theta_span = (theta_max - theta_min) if theta_max > theta_min else (theta_max + 2 * np.pi - theta_min)
+    theta_polar = np.linspace(theta_min, theta_min + theta_span, n_azimuth, endpoint=False, dtype=np.float32)
+
+    R, Theta = np.meshgrid(r_polar, theta_polar, indexing="ij")
+
+    # Convert to Cartesian coords (-r_max to r_max is mapped to 0 to grid_size)
+    X = R * np.cos(Theta)
+    Y = R * np.sin(Theta)
+
+    # Calculate indices in the Cartesian grid
+    x_idx = (X - (-r_max)) * (grid_size - 1) / (r_max - (-r_max) + 1e-12)
+    y_idx = (Y - (-r_max)) * (grid_size - 1) / (r_max - (-r_max) + 1e-12)
+
+    sampled = map_coordinates(
+        cart_data,
+        [y_idx.ravel(), x_idx.ravel()],  # order is Y (row), X (col)
+        order=1,
+        mode="constant",
+        cval=0.0,
+        prefilter=False,
+    ).reshape(n_range, n_azimuth)
+
+    return sampled.astype(cart_data.dtype)
+
+
 # Function to extract timestamp from filename
 def extract_timestamp(filename):
     """Extract timestamp from filename in the format: radar_YYYY-MM-DD_HH-MM-SS_ms.png"""
