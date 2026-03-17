@@ -76,7 +76,7 @@ def load_gps_data(csv_file_path = CSV_FILE_PATH):
     gps_data['time-string'] = pd.to_datetime(gps_data['time-string'])
     return gps_data
 
-# Add function which corrects the blank space in radar images 
+# TODO: Copy function from Fabius which corrects the blank space in radar images 
 
 
 if __name__ == "__main__":

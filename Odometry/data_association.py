@@ -1,228 +1,23 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.sparse.linalg import eigs
+import open3d as o3d
 
 from data_loading import load_radar_images, polar_to_cartesian_image, polar_to_cartesian_points
-from keypoint_extraction import compute_H_S, extract_keypoints, visualize_keypoints
+from keypoint_extraction import compute_H_S, Cen2019_keypoints, visualize_keypoints
+from descriptors import compute_descriptors
 
-def compute_descriptors(img, keypoints, alpha=18, rho=10, max_radius=50):
-    """
-    Compute rotation-invariant descriptors for radar keypoints.
-    
-    Parameters:
-    -----------
-    img : ndarray
-        The radar image (polar coordinates: angles x ranges)
-    keypoints : ndarray
-        Array of keypoints with shape (N, 2) where each row is (angle_idx, range_idx)
-    alpha : int
-        Number of angular slices for angular histogram
-    rho : int
-        Number of annuli for radial histogram
-    max_radius : int
-        Maximum radius around keypoint to consider for descriptor
-    
-    Returns:
-    --------
-    descriptors : ndarray
-        Array of shape (N, alpha+rho) containing descriptors for each keypoint
-    """
-    descriptors = []
-    num_angles, num_ranges = img.shape
-    
-    for kp in keypoints:
-        a_kp, r_kp = int(kp[0]), int(kp[1])
-        
-        # Initialize histograms
-        angular_hist = np.zeros(alpha)
-        radial_hist = np.zeros(rho)
-        
-        # Define region around keypoint
-        angle_start = max(0, a_kp - max_radius)
-        angle_end = min(num_angles, a_kp + max_radius + 1)
-        range_start = max(0, r_kp - max_radius)
-        range_end = min(num_ranges, r_kp + max_radius + 1)
-        
-        # Iterate over neighborhood
-        for a in range(angle_start, angle_end):
-            for r in range(range_start, range_end):
-                # Compute relative position
-                da = a - a_kp
-                dr = r - r_kp
-                
-                # Skip if outside max_radius
-                dist = np.sqrt(da**2 + dr**2)
-                if dist > max_radius or dist == 0:
-                    continue
-                
-                # Compute angle relative to keypoint
-                theta = np.arctan2(da, dr)  # Angle in [-pi, pi]
-                theta_normalized = (theta + np.pi) / (2 * np.pi)  # Normalize to [0, 1]
-                
-                # Compute angular bin
-                angular_bin = int(theta_normalized * alpha) % alpha
-                
-                # Compute radial bin (distance from keypoint)
-                radial_bin = int((dist / max_radius) * rho)
-                radial_bin = min(radial_bin, rho - 1)
-                
-                # Range weighting: weight by range to correct for range-density bias
-                # Normalized range value (0 to 1)
-                range_weight = r / num_ranges
-                
-                # Intensity weight
-                intensity = img[a, r]
-                
-                # Combined weight
-                weight = intensity * range_weight
-                
-                # Add to histograms
-                angular_hist[angular_bin] += weight
-                radial_hist[radial_bin] += weight
-        
-        # Process angular histogram: FFT and normalize phase
-        # Take FFT
-        fft_angular = np.fft.fft(angular_hist)
-        # Get magnitude and phase
-        magnitude = np.abs(fft_angular)
-        phase = np.angle(fft_angular)
-        
-        # Normalize phase to [0, 1]
-        phase_normalized = (phase + np.pi) / (2 * np.pi)
-        
-        # Use magnitude for rotation invariance (alternative: use phase_normalized)
-        # According to paper: "normalize its phase" - using phase
-        angular_descriptor = phase_normalized[:alpha]
-        
-        # Normalize radial histogram
-        radial_sum = np.sum(radial_hist)
-        if radial_sum > 0:
-            radial_descriptor = radial_hist / radial_sum
-        else:
-            radial_descriptor = radial_hist
-        
-        # Concatenate descriptors
-        descriptor = np.concatenate([angular_descriptor, radial_descriptor])
-        descriptors.append(descriptor)
-    
-    return np.array(descriptors)
+def ICP_registration(points1, points2, max_iterations=20, distance_threshold=0.5):
+    # Create Open3D point clouds
+    pcd1 = o3d.geometry.PointCloud()
+    pcd2 = o3d.geometry.PointCloud()
+    pcd1.points = o3d.utility.Vector3dVector(points1)
+    pcd2.points = o3d.utility.Vector3dVector(points2)
 
-def estimate_oriented_surface_points(img, keypoints, r=5.0, f=2.0, min_neighbors=6, max_condition_number=1e5, z_min=None):
-    """
-    Estimate oriented surface points from a filtered radar point set.
-    
-    Parameters:
-    -----------
-    img : ndarray
-        Radar image (angles x ranges), used to derive reflected intensities.
-    keypoints : ndarray
-        Array with shape (N, 2) where each row is (angle_idx, range_idx)
-    r : float
-        Radius in meters used for local neighborhood statistics
-    f : float
-        Re-sampling factor for downsampling grid side length (r/f)
-    min_neighbors : int
-        Minimum number of points in local neighborhood to keep a surface estimate
-    max_condition_number : float
-        Maximum allowed covariance condition number
-    z_min : float or None
-        Minimum intensity used in W_jj = z_j - z_min. If None, uses image minimum.
-    
-    Returns:
-    --------
-    oriented_points : ndarray
-        Array of shape (M, 4) containing (mu_x, mu_y, n_x, n_y)
-    """
-    if keypoints is None or len(keypoints) == 0:
-        return np.empty((0, 4), dtype=float)
-    if img is None:
-        raise ValueError("img must be provided to compute intensity-weighted covariance")
-
-    # Convert (angle_idx, range_idx) points to Cartesian meters.
-    pf = polar_to_cartesian_points(keypoints[:, 1], keypoints[:, 0])
-
-    grid_size = r / f
-    if grid_size <= 0:
-        raise ValueError("r/f must be > 0")
-
-    # 1) Downsample Pf to Pd by keeping one centroid per grid cell.
-    cell_indices = np.floor(pf / grid_size).astype(int)
-    cells = {}
-    for idx, cell in enumerate(cell_indices):
-        key = (int(cell[0]), int(cell[1]))
-        if key not in cells:
-            cells[key] = []
-        cells[key].append(idx)
-
-    pd = []
-    for point_ids in cells.values():
-        centroid = np.mean(pf[point_ids], axis=0)
-        pd.append(centroid)
-
-    if len(pd) == 0:
-        return np.empty((0, 4), dtype=float)
-
-    pd = np.asarray(pd, dtype=float)
-
-    if z_min is None:
-        z_min = float(np.min(img))
-
-    # 2) For each pi in Pd, estimate local distribution from neighbors in Pf within radius r.
-    oriented_points = []
-    for pi in pd:
-        diffs = pf - pi
-        dists = np.linalg.norm(diffs, axis=1)
-        neighbor_mask = dists <= r
-        neighbors = pf[neighbor_mask]
-        neighbor_ids = np.where(neighbor_mask)[0]
-
-        # Discard ill-defined local distributions.
-        if neighbors.shape[0] < min_neighbors:
-            continue
-
-        # Additional filtering step: discard neighborhoods from only one azimuth bin.
-        neighbor_azimuths = keypoints[neighbor_ids, 0].astype(int)
-        if np.unique(neighbor_azimuths).size <= 1:
-            continue
-
-        # Build weights W_jj = z_j - z_min and normalize by trace(W).
-        neighbor_ranges = keypoints[neighbor_ids, 1].astype(int)
-        neighbor_intensities = img[neighbor_azimuths, neighbor_ranges].astype(float)
-        weights = np.maximum(neighbor_intensities - z_min, 0.0)
-        trace_w = float(np.sum(weights))
-        if trace_w <= 0.0:
-            weights = np.ones_like(weights, dtype=float) / len(weights)
-        else:
-            weights = weights / trace_w
-
-        # Weighted sample mean mu_i.
-        mu_i = np.sum(neighbors * weights[:, np.newaxis], axis=0)
-        centered = neighbors - mu_i
-
-        # Weighted sample covariance: Sigma_i = (P-mu) W (P-mu)^T.
-        # centered has shape (l, 2), so we use centered.T @ W @ centered -> (2, 2).
-        sigma_i = centered.T @ (weights[:, np.newaxis] * centered)
-
-        eigenvalues, eigenvectors = np.linalg.eigh(sigma_i)
-        lambda_min = float(eigenvalues[0])
-        lambda_max = float(eigenvalues[-1])
-
-        if lambda_min <= 0:
-            continue
-
-        kappa = lambda_max / lambda_min
-        if kappa > max_condition_number:
-            continue
-
-        # 3) Normal is eigenvector corresponding to smallest eigenvalue.
-        n_i = eigenvectors[:, 0]
-        n_i = n_i / (np.linalg.norm(n_i) + 1e-12)
-        oriented_points.append([mu_i[0], mu_i[1], n_i[0], n_i[1]])
-
-    if len(oriented_points) == 0:
-        return np.empty((0, 4), dtype=float)
-
-    return np.asarray(oriented_points, dtype=float)
+    # Initial alignment using Open3D's ICP
+    threshold = distance_threshold
+    reg = o3d.pipelines.registration.registration_icp(pcd1, pcd2, threshold, np.eye(4))
+    return reg.transformation
 
 def unaryMatchesFromDescriptors(desc1, desc2):
     """
@@ -450,7 +245,7 @@ def _rotation_matrix(theta):
     s = np.sin(theta)
     return np.array([[c, -s], [s, c]], dtype=float)
 
-
+#TODO: Check this implementation
 def _register_pair_cfear(
     oriented_points1,
     oriented_points2,
@@ -671,6 +466,7 @@ def registration_from_oriented_points(oriented_points, window_size=5, max_iterat
             transforms.append((R_k, t_k))
 
     # Simple window smoothing on translation for stability.
+    #TODO: Remove it and implement proper adjustment over the window instead.
     if window_size > 1 and len(transforms) > 0:
         smoothed = []
         for i in range(len(transforms)):
@@ -728,8 +524,8 @@ if __name__ == "__main__":
     S1, H1 = compute_H_S(img1)
     S2, H2 = compute_H_S(img2)
     
-    keypoints1 = extract_keypoints(H1, S1, l_max=100)
-    keypoints2 = extract_keypoints(H2, S2, l_max=100)
+    keypoints1 = Cen2019_keypoints(H1, S1, l_max=100)
+    keypoints2 = Cen2019_keypoints(H2, S2, l_max=100)
     
     visualize_keypoints(img1, cartesian_image1, keypoints1)
     visualize_keypoints(img2, cartesian_image2, keypoints2)
