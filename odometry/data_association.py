@@ -3,6 +3,14 @@ import matplotlib.pyplot as plt
 from scipy.sparse.linalg import eigs
 import open3d as o3d
 
+import sys
+from pathlib import Path
+
+# Add the project root folder to sys.path
+project_root = Path(__file__).resolve().parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
 from utils.data_loading import load_radar_images, polar_to_cartesian_image, polar_to_cartesian_points
 from keypoint_extraction import compute_H_S, Cen2019_keypoints, visualize_keypoints
 from descriptors import compute_descriptors
@@ -258,6 +266,7 @@ def _register_pair_cfear(
 ):
     """
     Register two oriented point sets using CFEAR-3 approach.
+    Optimized version with vectorized operations and precomputation.
     
     Corresponds to equation (5-6) in paper:
     arg min_xt fs2k(Mk, Mt, xt) = sum_{i,j in C} wi,j * Lδ(g(mk_j, mt_i, xt))
@@ -269,9 +278,13 @@ def _register_pair_cfear(
         covariance : 3x3 pose covariance (if return_covariance=True)
     """
     if oriented_points1 is None or oriented_points2 is None:
-        return np.eye(2), np.zeros(2), [], None if return_covariance else (np.eye(2), np.zeros(2), [])
+        if return_covariance:
+            return np.eye(2), np.zeros(2), [], np.eye(3) * 1e6
+        return np.eye(2), np.zeros(2), []
     if len(oriented_points1) == 0 or len(oriented_points2) == 0:
-        return np.eye(2), np.zeros(2), [], None if return_covariance else (np.eye(2), np.zeros(2), [])
+        if return_covariance:
+            return np.eye(2), np.zeros(2), [], np.eye(3) * 1e6
+        return np.eye(2), np.zeros(2), []
 
     oriented_points1 = np.asarray(oriented_points1, dtype=float)
     oriented_points2 = np.asarray(oriented_points2, dtype=float)
@@ -280,102 +293,131 @@ def _register_pair_cfear(
     t = np.zeros(2, dtype=float)
     correspondences = []
     theta_max_rad = np.deg2rad(theta_max_deg)
-
+    last_hessian = np.eye(3, dtype=float) * 1e6
+    
+    # Precompute covariances and eigenvalues for set 2 (constant during iterations)
+    n_points2 = oriented_points2.shape[0]
+    sigma2_list = []
+    eigvals2_list = []
+    for j in range(n_points2):
+        n2 = oriented_points2[j, 2:]
+        sigma2 = _covariance_from_normal(n2)
+        sigma2_list.append(sigma2)
+        eigvals2 = np.linalg.eigvalsh(sigma2)
+        eigvals2_list.append(eigvals2)
+    
+    n_points1 = oriented_points1.shape[0]
+    cos_theta_max = np.cos(theta_max_rad)  # Use dot product threshold instead of arccos
+    distance_gate_sq = distance_gate ** 2  # Use squared distances
+    
     for iteration in range(max_iterations):
-        R = _rotation_matrix(theta)
+        c = np.cos(theta)  # Precompute cos/sin
+        s = np.sin(theta)
+        # R = [[c, -s], [s, c]]
+        
+        # Vectorized transformation for set 1
+        mu1_all = oriented_points1[:, :2]  # (n_points1, 2)
+        n1_all = oriented_points1[:, 2:]   # (n_points1, 2)
+        
+        # Transform mu1: R @ mu1 + t
+        mu1_t_all = np.array([c * mu1_all[:, 0] - s * mu1_all[:, 1],
+                              s * mu1_all[:, 0] + c * mu1_all[:, 1]], dtype=float).T + t  # (n_points1, 2)
+        
+        # Transform normals: R @ n1
+        n1_t_all = np.array([c * n1_all[:, 0] - s * n1_all[:, 1],
+                             s * n1_all[:, 0] + c * n1_all[:, 1]], dtype=float).T  # (n_points1, 2)
+        
+        mu2_all = oriented_points2[:, :2]  # (n_points2, 2)
+        n2_all = oriented_points2[:, 2:]   # (n_points2, 2)
 
-        # Find correspondences: nearest point within radius r with similar normal
-        # Criterion: arccos(nj · ni) < θmax
+        # Find correspondences using vectorized operations
         correspondences = []
-        for i in range(oriented_points1.shape[0]):
-            mu1 = oriented_points1[i, :2]
-            n1 = oriented_points1[i, 2:]
-            mu1_t = R @ mu1 + t
-            n1_t = R @ n1
-
-            best_j = -1
-            best_dist = distance_gate + 1.0
+        
+        # Vectorized distance computation: (n_points1, n_points2)
+        # dist[i,j] = ||mu2[j] - mu1_t[i]||^2
+        diff = mu2_all[np.newaxis, :, :] - mu1_t_all[:, np.newaxis, :]  # (n_points1, n_points2, 2)
+        dist_sq = np.sum(diff**2, axis=2)  # (n_points1, n_points2)
+        
+        # Vectorized normal similarity: (n_points1, n_points2)
+        # dot product n1_t[i] · n2[j]
+        normal_dots = np.dot(n1_t_all, n2_all.T)  # (n_points1, n_points2)
+        
+        # Find best match for each point in set 1
+        for i in range(n_points1):
+            # Apply distance gate and normal similarity filters
+            valid_mask = (dist_sq[i, :] <= distance_gate_sq) & (normal_dots[i, :] >= cos_theta_max)
             
-            for j in range(oriented_points2.shape[0]):
-                mu2 = oriented_points2[j, :2]
-                n2 = oriented_points2[j, 2:]
-
-                # Check distance gate
-                dist = np.linalg.norm(mu2 - mu1_t)
-                if dist > distance_gate:
-                    continue
-
-                # Check normal similarity: arccos(nj · ni) < θmax
-                normal_dot = float(np.clip(np.dot(n1_t, n2), -1.0, 1.0))
-                angle_diff = np.arccos(normal_dot)
-                if angle_diff > theta_max_rad:
-                    continue
-
-                # Keep the closest valid match
-                if dist < best_dist:
-                    best_dist = dist
-                    best_j = j
-
-            if best_j != -1:
+            if np.any(valid_mask):
+                # Among valid matches, select closest
+                valid_indices = np.where(valid_mask)[0]
+                best_j = valid_indices[np.argmin(dist_sq[i, valid_indices])]
                 correspondences.append((i, best_j))
 
         if len(correspondences) < 3:
             break
 
-        # Minimize weighted scan-to-keyframe cost function (equation 6)
+        # Optimize: vectorized computation of residuals and Jacobians
         H = np.zeros((3, 3), dtype=float)
         g = np.zeros(3, dtype=float)
-
+        
+        num_corr = len(correspondences)
+        d_count = float(num_corr)
+        
         for i, j in correspondences:
             mu1 = oriented_points1[i, :2]
             n1 = oriented_points1[i, 2:]
             mu2 = oriented_points2[j, :2]
-            n2 = oriented_points2[j, 2:]
-
+            n2 = n2_all[j, :]
+            
+            # Precomputed covariance and eigenvalues for this correspondence
+            sigma2 = sigma2_list[j]
+            eigvals2 = eigvals2_list[j]
+            p_feat2 = (float(eigvals2[0]), float(eigvals2[1]))
+            
             # Compute residual based on cost function (equations 12-14)
-            sigma2 = _covariance_from_normal(n2)
             match cost_function:
                 case "p2p":
-                    residual = point_to_point_cost(mu1, mu2, R, t)
-                    # Jacobian for P2P: de/dxt where e = ||error||
-                    mu1_t = R @ mu1 + t
+                    residual = point_to_point_cost(mu1, mu2, np.array([[c, -s], [s, c]]), t)
+                    # Jacobian for P2P
+                    mu1_t = np.array([c * mu1[0] - s * mu1[1], s * mu1[0] + c * mu1[1]]) + t
                     error_vec = mu1_t - mu2
-                    error_norm = np.linalg.norm(error_vec) + 1e-12
-                    dR_dtheta_mu = R @ np.array([-mu1[1], mu1[0]], dtype=float)
+                    error_norm_sq = np.sum(error_vec**2) + 1e-12
+                    error_norm = np.sqrt(error_norm_sq)
+                    dR_dtheta_mu = np.array([-s * mu1[0] - c * mu1[1], c * mu1[0] - s * mu1[1]])
                     J = np.array([
                         2 * error_vec[0] / error_norm,
                         2 * error_vec[1] / error_norm,
-                        2 * float(error_vec.T @ dR_dtheta_mu) / error_norm
+                        2 * float(np.dot(error_vec, dR_dtheta_mu)) / error_norm
                     ], dtype=float)
                 case "p2l":
-                    residual = point_to_line_cost(mu1, mu2, n2, R, t)
-                    # Jacobian for P2L: d(n^T e)/dxt
-                    dR_dtheta_mu = R @ np.array([-mu1[1], mu1[0]], dtype=float)
-                    J = np.array([n2[0], n2[1], float(n2.T @ dR_dtheta_mu)], dtype=float)
+                    residual = point_to_line_cost(mu1, mu2, n2, np.array([[c, -s], [s, c]]), t)
+                    # Jacobian for P2L
+                    dR_dtheta_mu = np.array([-s * mu1[0] - c * mu1[1], c * mu1[0] - s * mu1[1]])
+                    J = np.array([n2[0], n2[1], float(np.dot(n2, dR_dtheta_mu))], dtype=float)
                 case "p2d":
-                    residual = point_to_distribution_cost(mu1, mu2, sigma2, R, t)
-                    # Jacobian for P2D: more complex, approximate with P2L form
-                    dR_dtheta_mu = R @ np.array([-mu1[1], mu1[0]], dtype=float)
-                    J = np.array([n2[0], n2[1], float(n2.T @ dR_dtheta_mu)], dtype=float)
+                    residual = point_to_distribution_cost(mu1, mu2, sigma2, np.array([[c, -s], [s, c]]), t)
+                    # Jacobian for P2D
+                    dR_dtheta_mu = np.array([-s * mu1[0] - c * mu1[1], c * mu1[0] - s * mu1[1]])
+                    J = np.array([n2[0], n2[1], float(np.dot(n2, dR_dtheta_mu))], dtype=float)
                 case _:
                     raise ValueError(f"Unknown cost_function: {cost_function}")
 
-            # Apply Huber loss as weight (equation 7)
+            # Apply Huber loss as weight
             huber_weight = Huber_loss(residual, huber_delta)
 
-            # Compute similarity weights (equation 8-11)
-            eigvals = np.linalg.eigvalsh(sigma2)
-            p_feat = (float(eigvals[0]), float(eigvals[1]))
-            # Use number of correspondences as proxy for detection count
-            d1 = float(len(correspondences))
-            d2 = float(len(correspondences))
-            w_similarity = combined_weight(p_feat, p_feat, d1, d2, R @ n1, n2)
+            # Compute similarity weights
+            eigvals1 = np.linalg.eigvalsh(_covariance_from_normal(n1))
+            p_feat1 = (float(eigvals1[0]), float(eigvals1[1]))
+            n1_t = np.array([c * n1[0] - s * n1[1], s * n1[0] + c * n1[1]])
+            w_similarity = combined_weight(p_feat1, p_feat2, d_count, d_count, n1_t, n2)
 
             # Combined weight: Huber * similarity
             w = huber_weight * w_similarity
 
             H += w * np.outer(J, J)
             g += w * J * residual
+
+        last_hessian = H
 
         # Solve for incremental update
         try:
@@ -389,12 +431,14 @@ def _register_pair_cfear(
         if np.linalg.norm(delta) < 1e-4:
             break
 
-    final_R = _rotation_matrix(theta)
+    c = np.cos(theta)
+    s = np.sin(theta)
+    final_R = np.array([[c, -s], [s, c]], dtype=float)
     
     # Estimate covariance from Hessian: C(xt) = (J^T J)^-1
     if return_covariance:
         try:
-            covariance = np.linalg.inv(H + 1e-9 * np.eye(3))
+            covariance = np.linalg.inv(last_hessian + 1e-9 * np.eye(3))
         except np.linalg.LinAlgError:
             covariance = np.eye(3) * 1e6  # Large uncertainty if singular
         return final_R, t, correspondences, covariance
@@ -402,7 +446,7 @@ def _register_pair_cfear(
     return final_R, t, correspondences
 
 
-def registration_from_oriented_points(oriented_points, window_size=5, max_iterations=20, return_covariance=False):
+def registration_from_oriented_points(oriented_points, cost_function="p2l", window_size=5, max_iterations=20, return_covariance=False):
     """
     Estimate rotation and translation using CFEAR-style oriented points.
     
@@ -434,6 +478,7 @@ def registration_from_oriented_points(oriented_points, window_size=5, max_iterat
             oriented_points[1],
             max_iterations=max_iterations,
             return_covariance=return_covariance,
+            cost_function=cost_function
         )
         return result
 
@@ -443,6 +488,7 @@ def registration_from_oriented_points(oriented_points, window_size=5, max_iterat
             oriented_points[1],
             max_iterations=max_iterations,
             return_covariance=return_covariance,
+            cost_function=cost_function
         )
         return result
 
@@ -457,6 +503,7 @@ def registration_from_oriented_points(oriented_points, window_size=5, max_iterat
             oriented_points[k + 1],
             max_iterations=max_iterations,
             return_covariance=return_covariance,
+            cost_function=cost_function
         )
         if return_covariance:
             R_k, t_k, _, cov_k = result

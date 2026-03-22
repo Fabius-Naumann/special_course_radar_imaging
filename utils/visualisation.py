@@ -1,7 +1,7 @@
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
-from __init__ import RESULTS_DIR
+from . import RESULTS_DIR
 
 
 def _display_or_save(filename=None):

@@ -1,6 +1,14 @@
 import numpy as np
 import cv2
+from scipy.spatial import cKDTree
 
+import sys
+from pathlib import Path
+
+# Add the project root folder to sys.path
+project_root = Path(__file__).resolve().parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 from utils.data_loading import polar_to_cartesian_points
 
 def compute_descriptors(img, keypoints, alpha=18, rho=10, max_radius=50):
@@ -112,8 +120,10 @@ def estimate_oriented_surface_points(img, keypoints, r=5.0, f=2.0, min_neighbors
     
     Parameters:
     -----------
-    img : ndarray
-        Radar image (angles x ranges), used to derive reflected intensities.
+    img : ndarray or tuple
+        Cartesian radar image as either:
+        - 2D array (H, W), or
+        - tuple (cart_img, x_axis, y_axis) from polar_to_cartesian_image.
     keypoints : ndarray
         Cartesian keypoints with shape (N, 2) corresponding to the radar points in Pf.
     r : float
@@ -132,6 +142,27 @@ def estimate_oriented_surface_points(img, keypoints, r=5.0, f=2.0, min_neighbors
     oriented_points : ndarray
         Array of shape (M, 4) containing (mu_x, mu_y, n_x, n_y)
     """
+
+    if isinstance(img, tuple):
+        if len(img) != 3:
+            raise ValueError("When img is tuple, expected (cart_img, x_axis, y_axis)")
+        cart_img = np.asarray(img[0], dtype=float)
+        x_axis = np.asarray(img[1], dtype=float)
+        y_axis = np.asarray(img[2], dtype=float)
+        if cart_img.ndim != 2 or x_axis.ndim != 1 or y_axis.ndim != 1:
+            raise ValueError("Tuple img must be (2D image, 1D x_axis, 1D y_axis)")
+        use_metric_axes = True
+    else:
+        cart_img = np.asarray(img, dtype=float)
+        if cart_img.ndim != 2:
+            raise ValueError(f"Expected img as 2D array or tuple, got shape {cart_img.shape}")
+        use_metric_axes = False
+
+    keypoints = np.asarray(keypoints, dtype=float)
+    if keypoints.ndim != 2 or keypoints.shape[1] != 2:
+        raise ValueError(f"Expected keypoints with shape (N, 2), got {keypoints.shape}")
+    if keypoints.size == 0:
+        return np.empty((0, 4), dtype=float), np.empty((0, 2), dtype=float)
 
     grid_size = r / f
 
@@ -155,29 +186,36 @@ def estimate_oriented_surface_points(img, keypoints, r=5.0, f=2.0, min_neighbors
     pd = np.asarray(pd, dtype=float)
 
     if z_min is None:
-        z_min = float(np.min(img))
+        z_min = float(np.min(cart_img))
 
     # 2) For each pi in Pd, estimate local distribution from neighbors in Pf within radius r.
+    kdtree = cKDTree(keypoints)
     oriented_points = []
     for pi in pd:
-        diffs = keypoints - pi
-        dists = np.linalg.norm(diffs, axis=1)
-        neighbor_mask = dists <= r
-        neighbors = keypoints[neighbor_mask]
-        neighbor_ids = np.where(neighbor_mask)[0]
+        neighbor_ids = np.asarray(kdtree.query_ball_point(pi, r), dtype=int)
+        if neighbor_ids.size == 0:
+            continue
+        neighbors = keypoints[neighbor_ids]
 
         # Discard ill-defined local distributions.
         if neighbors.shape[0] < min_neighbors:
             continue
 
-        # Additional filtering step: discard neighborhoods from only one azimuth bin.
-        neighbor_azimuths = keypoints[neighbor_ids, 0].astype(int)
-        if np.unique(neighbor_azimuths).size <= 1:
-            continue
-
         # Build weights W_jj = z_j - z_min and normalize by trace(W).
-        neighbor_ranges = keypoints[neighbor_ids, 1].astype(int)
-        neighbor_intensities = img[neighbor_azimuths, neighbor_ranges].astype(float)
+        if use_metric_axes:
+            neighbor_x = np.interp(
+                keypoints[neighbor_ids, 0], x_axis, np.arange(x_axis.size, dtype=float)
+            )
+            neighbor_y = np.interp(
+                keypoints[neighbor_ids, 1], y_axis, np.arange(y_axis.size, dtype=float)
+            )
+        else:
+            neighbor_x = keypoints[neighbor_ids, 0]
+            neighbor_y = keypoints[neighbor_ids, 1]
+
+        neighbor_x = np.clip(np.rint(neighbor_x).astype(int), 0, cart_img.shape[1] - 1)
+        neighbor_y = np.clip(np.rint(neighbor_y).astype(int), 0, cart_img.shape[0] - 1)
+        neighbor_intensities = cart_img[neighbor_y, neighbor_x].astype(float)
         weights = np.maximum(neighbor_intensities - z_min, 0.0)
         trace_w = float(np.sum(weights))
         if trace_w <= 0.0:

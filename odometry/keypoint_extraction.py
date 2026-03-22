@@ -5,7 +5,14 @@ from scipy.signal import convolve
 from scipy.stats import norm
 import cv2
 
-from utils.data_loading import load_radar_images, polar_to_cartesian_image, polar_to_cartesian_points
+import sys
+from pathlib import Path
+
+# Add the project root folder to sys.path
+project_root = Path(__file__).resolve().parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+from utils.data_loading import load_radar_images, polar_to_cartesian_image, polar_to_cartesian_points, cartesian_to_polar_points
 
 def compute_H_S(img, return_mag = False):
     # Compute the gradient using the Prewitt operator in both directions
@@ -421,16 +428,44 @@ def orb_keypoints(img, num_keypoints=300):
 def motion_compensation(keypoints, ego_motion, azimuth_bins=400, delta_T=0.5):
     """Apply motion compensation to keypoints based on ego-motion data.
     Assume that there is no acceleration.
-    ego_motion = (v_x, v_y, theta) - velocity in x and y direction and angular velocity"""
+    ego_motion = (v_x, v_y, theta) - velocity in x and y direction and angular velocity
 
-    time_offset = (keypoints[:, 0] - azimuth_bins/2)*delta_T/2
+    Parameters
+    ----------
+    keypoints : ndarray of shape (N, 2)
+        Keypoints in cartesian coordinates (meters for cartesian).
+    ego_motion : tuple
+        (v_x, v_y, omega) where v is in m/s and omega is in rad/s.
+    azimuth_bins : int
+        Number of azimuth bins (for polar coordinate system only).
+    delta_T : float
+        Total scan duration in seconds.
+    coordinate_system : str
+        "polar" (default) uses azimuth-dependent time offsets,
+        "cartesian" applies a uniform half-scan offset.
+    """
+    keypoints = np.asarray(keypoints, dtype=float)
 
-    R = np.array([[np.cos(-ego_motion[2]), -np.sin(-ego_motion[2])],
-                  [np.sin(-ego_motion[2]), np.cos(-ego_motion[2])]])
-    trans = np.array([ego_motion[0], ego_motion[1]])
+    keypoints_angular = cartesian_to_polar_points(keypoints)
+    v_x, v_y, omega = ego_motion
 
-    compensated_keypoints = R @ keypoints - time_offset*trans
+    R = np.array([np.cos(-omega), -np.sin(-omega)], [np.sin(-omega), np.cos(-omega)])
+    time_offsets = (keypoints_angular[:,0] - azimuth_bins / 2)* delta_t / 2
 
+    compensated_keypoints = []
+    for i, (a, r) in enumerate(keypoints_angular):
+        # Compute the time offset for this keypoint based on its azimuth
+        time_offset = time_offsets[i]
+
+        # Compute the translation due to linear motion
+        translation = np.array([v_x * time_offset, v_y * time_offset])
+
+        # Compute the rotation due to angular motion
+        rotation = R @ keypoints[i]
+
+        # Apply compensation: first rotate, then translate
+        compensated_point = rotation + translation
+        compensated_keypoints.append(compensated_point)
     return compensated_keypoints
 
 def visualize_kp_pipeline(img, keypoints, mask):

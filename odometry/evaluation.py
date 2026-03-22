@@ -9,6 +9,14 @@ import matplotlib.pyplot as plt
 import folium
 from scipy.ndimage import shift, rotate
 
+import sys
+from pathlib import Path
+
+# Add the project root folder to sys.path
+project_root = Path(__file__).resolve().parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
 from utils.data_loading import extract_timestamp, load_gps_data, load_radar_images, polar_to_cartesian_image
 from keypoint_extraction import Cen2019_keypoints, compute_H_S
 from data_association import compute_descriptors, unaryMatchesFromDescriptors, compute_pairwiseCompatibilityScore, select_matches
@@ -174,8 +182,8 @@ def create_stabilized_overlay_video(
     rotations_deg,
     translations,
     output_file="odometry/transformed_overlay.mp4",
-    fps=8,
-    frames_per_image=4,
+    fps: int = 8,
+    frames_per_image: int = 4,
 ):
     """
     Create a video where each radar frame is transformed into the first-frame
@@ -199,12 +207,11 @@ def create_stabilized_overlay_video(
         raise ValueError(
             "'rotations_deg' and 'translations' must both have length len(images)-1."
         )
+    
     if int(frames_per_image) < 1:
         raise ValueError("'frames_per_image' must be >= 1.")
 
-    frames_per_image = int(frames_per_image)
-
-    cart_images = [polar_to_cartesian_image(img).astype(np.float32) for img in images]
+    cart_images = [polar_to_cartesian_image(img)[0].astype(np.float32) for img in images]
     h, w = cart_images[0].shape
 
     # Approximate radar image metric scale (same assumption as visualization code).
@@ -382,6 +389,22 @@ def calculate_gps_bearing(gps_entry1, gps_entry2):
 
     return compass_bearing
 
+def extract_gps_bearing(gps_subset):
+    """
+    Extract the bearing from GPS data.
+    
+    Parameters:
+    - gps_subset: DataFrame containing GPS data with a 'bearing' column
+    
+    Returns:
+    - bearing: Bearing in degrees (mean of available bearings)
+    """
+    if 'bearing' in gps_subset.columns and not gps_subset['bearing'].isnull().all():
+        return gps_subset['bearing'].mean()
+    else:
+        print("No valid 'bearing' data found in GPS subset.")
+        return None
+
 def calculate_gt_motion(gps_subset):
     """
     Calculate the ground truth motion (translation) from GPS data.
@@ -398,17 +421,17 @@ def calculate_gt_motion(gps_subset):
         return None, None
     
     gt_translation = []
-    gt_bearing = []
+    #gt_bearing = []
 
     for i in range(len(gps_subset) - 1):
         gps_entry1 = gps_subset.iloc[i]
         gps_entry2 = gps_subset.iloc[i + 1]
         distance = calculate_gps_distance(gps_entry1, gps_entry2)
         gt_translation.append(distance)
-        bearing = calculate_gps_bearing(gps_entry1, gps_entry2)
-        gt_bearing.append(bearing)
+        #bearing = calculate_gps_bearing(gps_entry1, gps_entry2)
+        #gt_bearing.append(bearing)
 
-    return gt_translation, gt_bearing
+    return gt_translation #, gt_bearing
 
 def interpolate_gps_motion(gps_subset, timestamps):
     """
@@ -419,10 +442,24 @@ def interpolate_gps_motion(gps_subset, timestamps):
     - timestamps: List of timestamps to interpolate GPS positions for
     
     Returns:
-    - interpolated_positions: DataFrame with columns ['time-string', 'latitude', 'longitude']
+    - interpolated_positions: DataFrame with columns ['time-string', 'latitude', 'longitude', 'bearing']
     """
     interpolated_positions = []
     gps_sorted = gps_subset.sort_values('time-string').reset_index(drop=True)
+
+    def interpolate_bearing(before_bearing, after_bearing, ratio):
+        """Interpolate compass angles (degrees) along the shortest arc."""
+        if pd.isna(before_bearing) and pd.isna(after_bearing):
+            return np.nan
+        if pd.isna(before_bearing):
+            return float(after_bearing)
+        if pd.isna(after_bearing):
+            return float(before_bearing)
+
+        before_bearing = float(before_bearing) % 360.0
+        after_bearing = float(after_bearing) % 360.0
+        delta = ((after_bearing - before_bearing + 180.0) % 360.0) - 180.0
+        return (before_bearing + ratio * delta) % 360.0
     
     for t in timestamps:
         radar_time_point = pd.to_datetime(t)
@@ -435,7 +472,8 @@ def interpolate_gps_motion(gps_subset, timestamps):
             interpolated_positions.append({
                 'time-string': radar_time_point,
                 'latitude': nearest['latitude'],
-                'longitude': nearest['longitude']
+                'longitude': nearest['longitude'],
+                'bearing': nearest['bearing'] if 'bearing' in gps_sorted.columns else np.nan
             })
             continue
 
@@ -444,7 +482,8 @@ def interpolate_gps_motion(gps_subset, timestamps):
             interpolated_positions.append({
                 'time-string': radar_time_point,
                 'latitude': nearest['latitude'],
-                'longitude': nearest['longitude']
+                'longitude': nearest['longitude'],
+                'bearing': nearest['bearing'] if 'bearing' in gps_sorted.columns else np.nan
             })
             continue
 
@@ -457,7 +496,8 @@ def interpolate_gps_motion(gps_subset, timestamps):
             interpolated_positions.append({
                 'time-string': radar_time_point,
                 'latitude': before['latitude'],
-                'longitude': before['longitude']
+                'longitude': before['longitude'],
+                'bearing': before['bearing'] if 'bearing' in gps_sorted.columns else np.nan
             })
         else:
             # Linear interpolation based on time
@@ -466,7 +506,8 @@ def interpolate_gps_motion(gps_subset, timestamps):
                 interpolated_positions.append({
                     'time-string': radar_time_point,
                     'latitude': before['latitude'],
-                    'longitude': before['longitude']
+                    'longitude': before['longitude'],
+                    'bearing': before['bearing'] if 'bearing' in gps_sorted.columns else np.nan
                 })
                 continue
             
@@ -475,11 +516,17 @@ def interpolate_gps_motion(gps_subset, timestamps):
             
             lat_interp = before['latitude'] + ratio * (after['latitude'] - before['latitude'])
             lon_interp = before['longitude'] + ratio * (after['longitude'] - before['longitude'])
+            bearing_interp = (
+                interpolate_bearing(before['bearing'], after['bearing'], ratio)
+                if 'bearing' in gps_sorted.columns
+                else np.nan
+            )
             
             interpolated_positions.append({
                 'time-string': radar_time_point,
                 'latitude': lat_interp,
-                'longitude': lon_interp
+                'longitude': lon_interp,
+                'bearing': bearing_interp
             })
     
     return pd.DataFrame(interpolated_positions)
@@ -539,7 +586,7 @@ def map_gps(gps_data, odo_trans, timestamps, odo_rotations_deg=None, output_file
             if odo_rotations_deg is not None and i < len(odo_rotations_deg):
                 # Odometry yaw is treated as math-positive (CCW). Convert to compass update.
                 delta_heading_deg = ((float(odo_rotations_deg[i]) + 180.0) % 360.0) - 180.0
-                current_heading_deg = (current_heading_deg - delta_heading_deg) % 360.0
+                current_heading_deg = (current_heading_deg + delta_heading_deg) % 360.0
             headings_odo.append(current_heading_deg)
         else:
             # If trans is malformed, skip it
@@ -620,6 +667,7 @@ def map_gps(gps_data, odo_trans, timestamps, odo_rotations_deg=None, output_file
 
     fmap.save(output_file)
     print(f"Saved OpenStreetMap visualization to {output_file}")
+    return fmap
 
 if __name__ == "__main__":
     ransac = True

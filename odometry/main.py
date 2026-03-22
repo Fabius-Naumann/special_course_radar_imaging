@@ -1,3 +1,11 @@
+import sys
+from pathlib import Path
+
+# Add the project root folder to sys.path
+project_root = Path(__file__).resolve().parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+    
 from utils.data_loading import load_radar_images, load_gps_data, extract_timestamp
 from keypoint_extraction import compute_H_S, Cen2019_keypoints, k_strongest_keypoints
 from descriptors import compute_descriptors, estimate_oriented_surface_points, orb_descriptor, radial_statistics_descriptor

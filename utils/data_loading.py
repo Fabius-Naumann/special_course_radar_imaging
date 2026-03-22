@@ -3,7 +3,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from __init__ import DATA_DIR, RESULTS_DIR
+from . import DATA_DIR, RESULTS_DIR
 from scipy.ndimage import map_coordinates
 
 # Folder and file paths to the radar images and GPS data
@@ -21,6 +21,19 @@ def polar_to_cartesian_points(ranges, angles, range_resolution=0.155, angle_reso
     points = np.stack((x, y), axis=-1)
 
     return points
+
+
+def cartesian_to_polar_points(points, range_resolution=0.155, angle_resolution=2 * np.pi / 400):
+    """
+    Convert Cartesian coordinates (x, y) to polar coordinates (ranges and angles) and scaling them according to the resolution.
+    """
+    x = points[:, 0]
+    y = points[:, 1]
+    ranges = np.sqrt(x**2 + y**2) / range_resolution
+    angles = np.arctan2(y, x) / angle_resolution
+    polar_points = np.stack((angles, ranges), axis=-1)
+
+    return polar_points
 
 
 def _normalize_polar_layout(data, data_layout="auto"):
