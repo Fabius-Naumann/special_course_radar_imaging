@@ -1,9 +1,16 @@
-import data_loading
+import sys
+from pathlib import Path
+
 import matplotlib.pyplot as plt
 import numpy as np
-from cfar import CFAR_PFA, cfar2d_polar_ca, suggest_default_params
-from data_loading import cartesian_to_polar_image, polar_to_cartesian_image
 from scipy.ndimage import binary_closing, binary_opening, label
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from utils.cfar import CFAR_PFA, cfar2d_polar_ca, suggest_default_params
+from utils.data_loading import _normalize_polar_layout, cartesian_to_polar_image, polar_to_cartesian_image
 
 
 def extract_shoreline(img, min_cluster_area=4, morph_open_k=3, morph_close_k=5, grid_size=4096):
@@ -53,7 +60,7 @@ def extract_shoreline(img, min_cluster_area=4, morph_open_k=3, morph_close_k=5, 
         cart_mask = clean_mask
 
     # 4. Cartesian to Polar mapping
-    n_range, n_azimuth = data_loading._normalize_polar_layout(img).shape
+    n_range, n_azimuth = _normalize_polar_layout(img).shape
     polar_mask_normalized = cartesian_to_polar_image(cart_mask.astype(np.float32), polar_shape=(n_range, n_azimuth))
     polar_mask_normalized = polar_mask_normalized > 0.5
 
@@ -84,8 +91,8 @@ def extract_shoreline(img, min_cluster_area=4, morph_open_k=3, morph_close_k=5, 
 
 
 if __name__ == "__main__":
-    from data_loading import load_radar_images, polar_to_cartesian_points
-    from visualisation import _display_or_save
+    from utils.data_loading import load_radar_images, polar_to_cartesian_points
+    from utils.visualisation import _display_or_save
 
     print("Loading radar images...")
     filenames, images = load_radar_images(num_images=1)

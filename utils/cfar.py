@@ -1,8 +1,17 @@
+import sys
+from pathlib import Path
+
 import cv2
 import numpy as np
-from data_loading import load_radar_images, polar_to_cartesian_image
 from scipy.ndimage import rank_filter
-from visualisation import plot_radars_side_by_side
+
+if __package__ in {None, ""}:
+    PROJECT_ROOT = Path(__file__).resolve().parents[1]
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
+
+from utils.data_loading import load_radar_images, polar_to_cartesian_image
+from utils.visualisation import plot_radars_side_by_side
 
 # =============================================================================
 # Polar CFAR utilities for radar intensity images
