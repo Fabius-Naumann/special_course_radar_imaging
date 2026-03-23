@@ -145,3 +145,114 @@ def plot_radars_side_by_side(images, titles=None, fig_size=5, x=None, y=None, fi
 
     plt.tight_layout()
     _display_or_save(filename)
+
+
+def plot_shoreline_extraction(img, shoreline_points, cart_mask, polar_mask, cluster_labels=None, output_path=None):
+    """
+    Plot the results of shoreline extraction.
+    """
+    # Import locally to avoid circular imports
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    from utils.data_loading import polar_to_cartesian_image, polar_to_cartesian_points
+
+    cart_img, x_coords, y_coords = polar_to_cartesian_image(img, grid_size=1024)
+
+    cart_shoreline_x = []
+    cart_shoreline_y = []
+    if shoreline_points:
+        azs, ranges = zip(*shoreline_points)
+        pts = polar_to_cartesian_points(np.array(ranges), np.array(azs))
+        cart_shoreline_x = pts[:, 0]
+        cart_shoreline_y = pts[:, 1]
+
+    num_subplots = 5 if cluster_labels is not None else 4
+    fig, axs = plt.subplots(1, num_subplots, figsize=(6 * num_subplots, 6))
+
+    axs[0].imshow(img.T if img.shape[1] > img.shape[0] else img, aspect="auto", cmap="viridis", origin="lower")
+    axs[0].set_title("Polar Image with Shoreline")
+    axs[0].set_xlabel("Azimuth Bin")
+    axs[0].set_ylabel("Range Bin")
+
+    if shoreline_points:
+        axs[0].scatter(azs, ranges, c="red", s=5, label="Shoreline")
+        axs[0].legend()
+
+    axs[1].imshow(
+        cart_img,
+        extent=[x_coords.min(), x_coords.max(), y_coords.min(), y_coords.max()],
+        origin="lower",
+        cmap="viridis",
+    )
+    axs[1].set_title("Cartesian Image with Shoreline")
+    axs[1].set_xlabel("X (m)")
+    axs[1].set_ylabel("Y (m)")
+
+    if shoreline_points:
+        axs[1].scatter(cart_shoreline_x, cart_shoreline_y, c="red", s=3, label="Shoreline", zorder=5)
+        axs[1].legend()
+
+    axs[2].imshow(
+        cart_mask,
+        extent=[x_coords.min(), x_coords.max(), y_coords.min(), y_coords.max()],
+        aspect="equal",
+        cmap="gray",
+        origin="lower",
+    )
+    axs[2].set_title("Cartesian Mask (Morph. Cleanup)")
+    axs[2].set_xlabel("X (m)")
+
+    axs[3].imshow(
+        polar_mask.T if polar_mask.shape[1] > polar_mask.shape[0] else polar_mask,
+        aspect="auto",
+        cmap="gray",
+        origin="lower",
+    )
+    axs[3].set_title("Back-projected Polar Mask")
+    axs[3].set_xlabel("Azimuth Bin")
+
+    if cluster_labels is not None:
+        axs[4].imshow(
+            cart_img,
+            extent=[x_coords.min(), x_coords.max(), y_coords.min(), y_coords.max()],
+            origin="lower",
+            cmap="gray",
+            alpha=0.5,
+        )
+        n_clusters = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
+        axs[4].set_title(f"Shoreline Clusters (Estimated N={n_clusters})")
+        axs[4].set_xlabel("X (m)")
+        axs[4].set_ylabel("Y (m)")
+
+        if len(cart_shoreline_x) > 0:
+            cluster_labels = np.array(cluster_labels)
+            outliers = cluster_labels == -1
+            inliers = ~outliers
+            if np.any(outliers):
+                axs[4].scatter(
+                    cart_shoreline_x[outliers],
+                    cart_shoreline_y[outliers],
+                    c="black",
+                    s=4,
+                    marker="x",
+                    linewidths=0.5,
+                    alpha=0.9,
+                    zorder=4,
+                )
+            if np.any(inliers):
+                axs[4].scatter(
+                    cart_shoreline_x[inliers],
+                    cart_shoreline_y[inliers],
+                    c=cluster_labels[inliers],
+                    cmap="tab20",
+                    s=10,
+                    zorder=5,
+                )
+
+    plt.tight_layout()
+    if output_path:
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        _display_or_save("shoreline_test.png")
