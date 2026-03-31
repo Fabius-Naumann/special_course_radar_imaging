@@ -114,18 +114,15 @@ def compute_descriptors(img, keypoints, alpha=18, rho=10, max_radius=50):
     return np.array(descriptors)
 
 #TODO: Check this implementation
-def estimate_oriented_surface_points(img, keypoints, r=5.0, f=2.0, min_neighbors=6, max_condition_number=1e5, z_min=None):
+def estimate_oriented_surface_points(keypoints, r=5.0, f=2.0, min_neighbors=6, 
+                                      max_condition_number=1e5, z_min=None):
     """
-    Estimate oriented surface points from a filtered radar point set.
+    Estimate oriented surface points from keypoints with intensity information.
     
     Parameters:
     -----------
-    img : ndarray or tuple
-        Cartesian radar image as either:
-        - 2D array (H, W), or
-        - tuple (cart_img, x_axis, y_axis) from polar_to_cartesian_image.
     keypoints : ndarray
-        Cartesian keypoints with shape (N, 2) corresponding to the radar points in Pf.
+        Keypoints with shape (N, 3) where each row is (x, y, intensity)
     r : float
         Radius in meters used for local neighborhood statistics
     f : float
@@ -135,39 +132,27 @@ def estimate_oriented_surface_points(img, keypoints, r=5.0, f=2.0, min_neighbors
     max_condition_number : float
         Maximum allowed covariance condition number
     z_min : float or None
-        Minimum intensity used in W_jj = z_j - z_min. If None, uses image minimum.
+        Minimum intensity used in W_jj = z_j - z_min. If None, uses minimum from keypoints.
     
     Returns:
     --------
     oriented_points : ndarray
         Array of shape (M, 4) containing (mu_x, mu_y, n_x, n_y)
     """
-
-    if isinstance(img, tuple):
-        if len(img) != 3:
-            raise ValueError("When img is tuple, expected (cart_img, x_axis, y_axis)")
-        cart_img = np.asarray(img[0], dtype=float)
-        x_axis = np.asarray(img[1], dtype=float)
-        y_axis = np.asarray(img[2], dtype=float)
-        if cart_img.ndim != 2 or x_axis.ndim != 1 or y_axis.ndim != 1:
-            raise ValueError("Tuple img must be (2D image, 1D x_axis, 1D y_axis)")
-        use_metric_axes = True
-    else:
-        cart_img = np.asarray(img, dtype=float)
-        if cart_img.ndim != 2:
-            raise ValueError(f"Expected img as 2D array or tuple, got shape {cart_img.shape}")
-        use_metric_axes = False
-
     keypoints = np.asarray(keypoints, dtype=float)
-    if keypoints.ndim != 2 or keypoints.shape[1] != 2:
-        raise ValueError(f"Expected keypoints with shape (N, 2), got {keypoints.shape}")
+    if keypoints.ndim != 2 or keypoints.shape[1] != 3:
+        raise ValueError(f"Expected keypoints with shape (N, 3), got {keypoints.shape}")
     if keypoints.size == 0:
         return np.empty((0, 4), dtype=float), np.empty((0, 2), dtype=float)
 
+    # Extract positions and intensities
+    positions = keypoints[:, :2]  # (N, 2)
+    intensities = keypoints[:, 2]  # (N,)
+    
     grid_size = r / f
 
-    # 1) Downsample Pf to Pd by using one cell center per grid cell.
-    cell_indices = np.floor(keypoints / grid_size).astype(int)
+    # 1) Downsample to grid centers
+    cell_indices = np.floor(positions / grid_size).astype(int)
     cells = {}
     for idx, cell in enumerate(cell_indices):
         key = (int(cell[0]), int(cell[1]))
@@ -186,36 +171,24 @@ def estimate_oriented_surface_points(img, keypoints, r=5.0, f=2.0, min_neighbors
     pd = np.asarray(pd, dtype=float)
 
     if z_min is None:
-        z_min = float(np.min(cart_img))
+        z_min = float(np.min(intensities))
 
-    # 2) For each pi in Pd, estimate local distribution from neighbors in Pf within radius r.
-    kdtree = cKDTree(keypoints)
+    # 2) For each grid center, estimate local distribution from neighbors
+    kdtree = cKDTree(positions)
     oriented_points = []
+    
     for pi in pd:
         neighbor_ids = np.asarray(kdtree.query_ball_point(pi, r), dtype=int)
         if neighbor_ids.size == 0:
             continue
-        neighbors = keypoints[neighbor_ids]
+        
+        neighbors = positions[neighbor_ids]
+        neighbor_intensities = intensities[neighbor_ids]
 
-        # Discard ill-defined local distributions.
         if neighbors.shape[0] < min_neighbors:
             continue
 
-        # Build weights W_jj = z_j - z_min and normalize by trace(W).
-        if use_metric_axes:
-            neighbor_x = np.interp(
-                keypoints[neighbor_ids, 0], x_axis, np.arange(x_axis.size, dtype=float)
-            )
-            neighbor_y = np.interp(
-                keypoints[neighbor_ids, 1], y_axis, np.arange(y_axis.size, dtype=float)
-            )
-        else:
-            neighbor_x = keypoints[neighbor_ids, 0]
-            neighbor_y = keypoints[neighbor_ids, 1]
-
-        neighbor_x = np.clip(np.rint(neighbor_x).astype(int), 0, cart_img.shape[1] - 1)
-        neighbor_y = np.clip(np.rint(neighbor_y).astype(int), 0, cart_img.shape[0] - 1)
-        neighbor_intensities = cart_img[neighbor_y, neighbor_x].astype(float)
+        # Build weights from intensities
         weights = np.maximum(neighbor_intensities - z_min, 0.0)
         trace_w = float(np.sum(weights))
         if trace_w <= 0.0:
@@ -223,12 +196,9 @@ def estimate_oriented_surface_points(img, keypoints, r=5.0, f=2.0, min_neighbors
         else:
             weights = weights / trace_w
 
-        # Weighted sample mean mu_i.
+        # Weighted statistics
         mu_i = np.sum(neighbors * weights[:, np.newaxis], axis=0)
         centered = neighbors - mu_i
-
-        # Weighted sample covariance: Sigma_i = (P-mu) W (P-mu)^T.
-        # centered has shape (l, 2), so we use centered.T @ W @ centered -> (2, 2).
         sigma_i = centered.T @ (weights[:, np.newaxis] * centered)
 
         eigenvalues, eigenvectors = np.linalg.eigh(sigma_i)
@@ -242,7 +212,6 @@ def estimate_oriented_surface_points(img, keypoints, r=5.0, f=2.0, min_neighbors
         if kappa > max_condition_number:
             continue
 
-        # 3) Normal is eigenvector corresponding to smallest eigenvalue.
         n_i = eigenvectors[:, 0]
         n_i = n_i / (np.linalg.norm(n_i) + 1e-12)
         oriented_points.append([mu_i[0], mu_i[1], n_i[0], n_i[1]])

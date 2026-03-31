@@ -531,23 +531,73 @@ def interpolate_gps_motion(gps_subset, timestamps):
     
     return pd.DataFrame(interpolated_positions)
 
-def map_gps(gps_data, odo_trans, timestamps, odo_rotations_deg=None, output_file="odometry\gps_map.html"):
+def calculate_odo_longitude_latitude(start_lat, start_lon, translation_m, rotation_rad):
+    """
+    Calculate new GPS coordinates given a starting point, translation, and rotation.
+    
+    Parameters:
+    - start_lat: Starting latitude in degrees
+    - start_lon: Starting longitude in degrees
+    - translation_m: Translation distance in meters [x, y]
+    - rotation_rad: Rotation (bearing) in radians (0 rad=North, clockwise)
+    
+    Returns:
+    - new_lat: New latitude in degrees
+    - new_lon: New longitude in degrees
+    """
+    theta_rad = rotation_rad
+
+    # Calculate the change in position in meters
+    dx = translation_m[0] * np.cos(theta_rad) - translation_m[1] * np.sin(theta_rad)
+    dy = translation_m[0] * np.sin(theta_rad) + translation_m[1] * np.cos(theta_rad)
+    
+    # Approximate conversion from meters to degrees
+    lat_offset = dy / 111320.0  # 1 degree latitude ≈ 111,320 meters
+    lon_offset = dx / (111320.0 * np.cos(np.radians(start_lat)))  # Adjust for latitude
+    
+    new_lat = start_lat + lat_offset
+    new_lon = start_lon + lon_offset
+    
+    return new_lat, new_lon
+
+def map_gps(
+    gps_data,
+    odo_trans,
+    timestamps,
+    odo_rotations_rad=None,
+    odo_rotations_deg=None,
+    odo_rotations_reference="relative",
+    odo_longitudes=None,
+    odo_latitudes=None,
+    output_file="odometry\\gps_map.html",
+):
     """
     Visualize GPS points and trajectory on an OpenStreetMap basemap.
     
     Parameters:
-    - gps_data: Full DataFrame containing GPS data with 'latitude', 'longitude', and 'time-string' fields
-    - odo_trans: List of odometry translations in local frame [dx, dy]
-    - timestamps: List of timestamps to extract GPS data for
-    - odo_rotations_deg: Optional list of incremental yaw rotations (degrees), one per odometry step
+    - gps_data: Full DataFrame with GPS data ('latitude', 'longitude', 'time-string')
+    - odo_trans: Odometry translations. Supports either:
+        * incremental steps (N-1, 2) [dx, dy], or
+        * absolute local positions (N, 2)
+    - timestamps: Radar timestamps
+    - odo_rotations_rad: Optional odometry headings in radians (absolute)
+    - odo_rotations_deg: Optional odometry headings in degrees (absolute)
+        - odo_rotations_reference: "relative" (default) or "absolute".
+            Use "relative" when odometry yaw starts at 0 in frame-1.
+    - odo_longitudes: Optional odometry longitudes (direct trajectory input)
+    - odo_latitudes: Optional odometry latitudes (direct trajectory input)
     - output_file: HTML file path for the generated interactive map
     """
+    if timestamps is None or len(timestamps) == 0:
+        print("No timestamps provided for map generation.")
+        return None
+
     # Extract GPS data for the relevant timeframe
     gps_subset = extract_timeframe(gps_data, timestamps)
     
     if gps_subset.empty:
         print("No GPS data to visualize on the map.")
-        return
+        return None
 
     gps_plot = gps_subset.copy().reset_index(drop=True)
     coordinates = gps_plot[['latitude', 'longitude']].values.tolist()
@@ -555,42 +605,111 @@ def map_gps(gps_data, odo_trans, timestamps, odo_rotations_deg=None, output_file
 
     # Build odometry trajectory by converting translations to GPS coordinates
     # and accumulating heading from odometry rotations
-    # Start from first GPS coordinate
-    coordinates_odo = [coordinates[0]]
-    current_lat, current_lon = coordinates[0]
-    current_heading_deg = bearing[0] if len(bearing) > 0 else 0.0
-    headings_odo = [current_heading_deg]
-    
-    # Convert odometry translations (in meters) to GPS coordinate offsets
-    for i, trans in enumerate(odo_trans):
-        # Handle both numpy arrays and regular lists
-        if hasattr(trans, '__iter__') and len(trans) >= 2:
-            dx_local, dy_local = float(trans[0]), float(trans[1])
+    # Interpolate the initial position to fit the first radar timestamp
+    initial_pos = interpolate_gps_motion(gps_subset, [timestamps[0]])
+    if initial_pos.empty:
+        print("No GPS data available to determine initial position for odometry trajectory.")
+        return None
+    else:
+        initial_lat = initial_pos.iloc[0]['latitude']
+        initial_lon = initial_pos.iloc[0]['longitude']
+        coordinates.insert(0, [initial_lat, initial_lon])
 
-            # Rotate local translation into global map frame.
-            # current_heading_deg is compass heading (0°=North, clockwise),
-            # so convert to math angle (0°=East, counterclockwise).
-            heading_math_rad = np.radians(90.0 - current_heading_deg)
-            dx_global = np.cos(heading_math_rad) * dx_local - np.sin(heading_math_rad) * dy_local
-            dy_global = np.sin(heading_math_rad) * dx_local + np.cos(heading_math_rad) * dy_local
-            
-            # Approximate conversion: 1 degree latitude ≈ 111,320 meters
-            # 1 degree longitude varies with latitude: ≈ 111,320 * cos(latitude)
-            lat_offset = dy_global / 111320.0
-            lon_offset = dx_global / (111320.0 * np.cos(np.radians(current_lat)))
-            
-            current_lat += lat_offset
-            current_lon += lon_offset
-            coordinates_odo.append([current_lat, current_lon])
+    initial_heading_deg = bearing[0] if len(bearing) > 0 and pd.notna(bearing[0]) else 0.0
+    initial_heading_rad = np.radians(float(initial_heading_deg))
 
-            if odo_rotations_deg is not None and i < len(odo_rotations_deg):
-                # Odometry yaw is treated as math-positive (CCW). Convert to compass update.
-                delta_heading_deg = ((float(odo_rotations_deg[i]) + 180.0) % 360.0) - 180.0
-                current_heading_deg = (current_heading_deg + delta_heading_deg) % 360.0
-            headings_odo.append(current_heading_deg)
+    if odo_rotations_deg is not None:
+        odo_headings_rad = np.radians(np.asarray(odo_rotations_deg, dtype=float).reshape(-1))
+    elif odo_rotations_rad is not None:
+        odo_headings_rad = np.asarray(odo_rotations_rad, dtype=float).reshape(-1)
+    else:
+        odo_headings_rad = np.asarray([], dtype=float)
+
+    if len(odo_headings_rad) > 0 and str(odo_rotations_reference).lower() == "relative":
+        odo_headings_rad = odo_headings_rad + float(initial_heading_rad)
+
+    coordinates_odo = []
+    headings_odo = []
+
+    # Path 1: direct odometry GPS trajectory
+    if odo_latitudes is not None and odo_longitudes is not None:
+        lat_arr = np.asarray(odo_latitudes, dtype=float).reshape(-1)
+        lon_arr = np.asarray(odo_longitudes, dtype=float).reshape(-1)
+        n_pts = min(len(lat_arr), len(lon_arr))
+
+        if n_pts == 0:
+            print("No valid odometry latitude/longitude points provided.")
+            return None
+
+        for i in range(n_pts):
+            coordinates_odo.append([float(lat_arr[i]), float(lon_arr[i])])
+
+        if len(odo_headings_rad) >= n_pts:
+            headings_odo = [float(h) for h in odo_headings_rad[:n_pts]]
+        elif len(coordinates_odo) >= 2:
+            headings_odo = [initial_heading_rad]
+            for i in range(1, len(coordinates_odo)):
+                prev = {
+                    "latitude": coordinates_odo[i - 1][0],
+                    "longitude": coordinates_odo[i - 1][1],
+                }
+                curr = {
+                    "latitude": coordinates_odo[i][0],
+                    "longitude": coordinates_odo[i][1],
+                }
+                headings_odo.append(np.radians(calculate_gps_bearing(prev, curr)))
         else:
-            # If trans is malformed, skip it
-            continue
+            headings_odo = [initial_heading_rad]
+
+    # Path 2: reconstruct odometry GPS trajectory from translations
+    else:
+        trans_arr = np.asarray(odo_trans, dtype=float)
+        if trans_arr.ndim == 1:
+            trans_arr = trans_arr.reshape(-1, 2)
+        if trans_arr.ndim != 2 or trans_arr.shape[1] < 2:
+            raise ValueError("odo_trans must be array-like with shape (N,2) or (N-1,2).")
+
+        trans_arr = trans_arr[:, :2]
+
+        # If trajectory is absolute positions (len == timestamps), convert to step increments.
+        if len(trans_arr) == len(timestamps):
+            odo_steps = np.diff(trans_arr, axis=0)
+        else:
+            odo_steps = trans_arr
+
+        n_steps = len(odo_steps)
+        if n_steps == 0:
+            coordinates_odo = [[coordinates[0][0], coordinates[0][1]]]
+            headings_odo = [initial_heading_rad]
+        else:
+            if len(odo_headings_rad) == n_steps + 1:
+                step_headings = odo_headings_rad[1:]
+            elif len(odo_headings_rad) == n_steps:
+                step_headings = odo_headings_rad
+            elif len(odo_headings_rad) > n_steps:
+                step_headings = odo_headings_rad[:n_steps]
+            elif len(odo_headings_rad) > 0:
+                pad = np.full((n_steps - len(odo_headings_rad),), float(odo_headings_rad[-1]), dtype=float)
+                step_headings = np.concatenate([odo_headings_rad, pad])
+            else:
+                step_headings = np.full((n_steps,), initial_heading_rad, dtype=float)
+
+            current_lat, current_lon = coordinates[0]
+            coordinates_odo = [[current_lat, current_lon]]
+            headings_odo = [float(step_headings[0]) if n_steps > 0 else initial_heading_rad]
+
+            for i, trans in enumerate(odo_steps):
+                dx_local, dy_local = float(trans[0]), float(trans[1])
+                current_heading_rad = float(step_headings[i])
+
+                current_lat, current_lon = calculate_odo_longitude_latitude(
+                    current_lat,
+                    current_lon,
+                    [dx_local, dy_local],
+                    current_heading_rad,
+                )
+                coordinates_odo.append([current_lat, current_lon])
+                headings_odo.append(current_heading_rad)
 
     center_lat = float(gps_plot['latitude'].mean())
     center_lon = float(gps_plot['longitude'].mean())
@@ -622,7 +741,7 @@ def map_gps(gps_data, odo_trans, timestamps, odo_rotations_deg=None, output_file
             color="green",
             fill=True,
             fill_opacity=0.8,
-            tooltip=f"Odometry Point {i} | Heading: {headings_odo[i]:.2f}°"
+            tooltip=f"Odometry Point {i} | Heading: {np.degrees(headings_odo[i]):.2f}°"
         ).add_to(fmap)
 
     if len(coordinates) > 0:
@@ -654,7 +773,7 @@ def map_gps(gps_data, odo_trans, timestamps, odo_rotations_deg=None, output_file
         ).add_to(fmap)
 
         final_heading = float(headings_odo[-1])
-        heading_css_deg = final_heading - 90.0
+        heading_css_deg = np.degrees(final_heading) - 90.0
         arrow_html = (
             f'<div style="font-size: 20px; color: green; font-weight: bold; '
             f'transform: rotate({heading_css_deg:.2f}deg); transform-origin: center;">➤</div>'
@@ -662,7 +781,7 @@ def map_gps(gps_data, odo_trans, timestamps, odo_rotations_deg=None, output_file
         folium.Marker(
             location=coordinates_odo[-1],
             icon=folium.DivIcon(html=arrow_html),
-            tooltip=f"Odometry Heading: {final_heading:.2f}°"
+            tooltip=f"Odometry Heading: {np.degrees(final_heading):.2f}°"
         ).add_to(fmap)
 
     fmap.save(output_file)
@@ -724,4 +843,4 @@ if __name__ == "__main__":
     gt_translation, gt_bearing = calculate_gt_motion(gps_subset)
     print(f"Ground truth translation from GPS data: {gt_translation} m")
     print(f"Ground truth bearing from GPS data: {gt_bearing} degrees")
-    #map_gps(gps_data, [t], [timestamp1, timestamp2], odo_rotations_deg=[theta_deg])
+    #map_gps(gps_data, [t], [timestamp1, timestamp2], odo_rotations_rad=[np.radians(theta_deg)])

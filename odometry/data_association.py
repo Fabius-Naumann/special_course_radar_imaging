@@ -15,16 +15,23 @@ from utils.data_loading import load_radar_images, polar_to_cartesian_image, pola
 from keypoint_extraction import compute_H_S, Cen2019_keypoints, visualize_keypoints
 from descriptors import compute_descriptors
 
-def ICP_registration(points1, points2, max_iterations=20, distance_threshold=0.5):
+def ICP_registration(points1, points2, max_iterations=20, distance_threshold=0.5, R_init=np.eye(2), t_init=np.zeros(2)):
     # Create Open3D point clouds
     pcd1 = o3d.geometry.PointCloud()
     pcd2 = o3d.geometry.PointCloud()
     pcd1.points = o3d.utility.Vector3dVector(points1)
     pcd2.points = o3d.utility.Vector3dVector(points2)
 
+    # Convert 2D transformation to 4x4 homogeneous transformation matrix for Open3D
+    R = R_init
+    t = t_init
+    transformation_init = np.eye(4, dtype=float)
+    transformation_init[:2, :2] = R
+    transformation_init[:2, 3] = t
+
     # Initial alignment using Open3D's ICP
     threshold = distance_threshold
-    reg = o3d.pipelines.registration.registration_icp(pcd1, pcd2, threshold, np.eye(4))
+    reg = o3d.pipelines.registration.registration_icp(pcd1, pcd2, threshold, transformation_init, o3d.pipelines.registration.TransformationEstimationPointToPoint(), o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=max_iterations))
     return reg.transformation
 
 def unaryMatchesFromDescriptors(desc1, desc2):
@@ -263,6 +270,8 @@ def _register_pair_cfear(
     huber_delta=0.5,
     cost_function="p2l",  # "p2p", "p2l", or "p2d"
     return_covariance=False,
+    start_theta=0.0,
+    start_t=np.zeros(2, dtype=float)
 ):
     """
     Register two oriented point sets using CFEAR-3 approach.
@@ -289,8 +298,8 @@ def _register_pair_cfear(
     oriented_points1 = np.asarray(oriented_points1, dtype=float)
     oriented_points2 = np.asarray(oriented_points2, dtype=float)
 
-    theta = 0.0
-    t = np.zeros(2, dtype=float)
+    theta = start_theta
+    t = start_t
     correspondences = []
     theta_max_rad = np.deg2rad(theta_max_deg)
     last_hessian = np.eye(3, dtype=float) * 1e6
@@ -446,89 +455,232 @@ def _register_pair_cfear(
     return final_R, t, correspondences
 
 
-def registration_from_oriented_points(oriented_points, cost_function="p2l", window_size=5, max_iterations=20, return_covariance=False):
+def _build_cfear_normal_equations(
+    source_points,
+    target_points,
+    theta,
+    t,
+    cost_function="p2l",
+    distance_gate=6.0,
+    theta_max_deg=45.0,
+    huber_delta=0.5,
+):
+    source_points = np.asarray(source_points, dtype=float)
+    target_points = np.asarray(target_points, dtype=float)
+    if source_points.size == 0 or target_points.size == 0:
+        return np.zeros((3, 3), dtype=float), np.zeros(3, dtype=float), [], 0.0
+
+    c = np.cos(theta)
+    s = np.sin(theta)
+
+    mu1_all = source_points[:, :2]
+    n1_all = source_points[:, 2:]
+    mu2_all = target_points[:, :2]
+    n2_all = target_points[:, 2:]
+
+    mu1_t_all = np.array(
+        [
+            c * mu1_all[:, 0] - s * mu1_all[:, 1],
+            s * mu1_all[:, 0] + c * mu1_all[:, 1],
+        ],
+        dtype=float,
+    ).T + t
+    n1_t_all = np.array(
+        [
+            c * n1_all[:, 0] - s * n1_all[:, 1],
+            s * n1_all[:, 0] + c * n1_all[:, 1],
+        ],
+        dtype=float,
+    ).T
+
+    theta_max_rad = np.deg2rad(theta_max_deg)
+    cos_theta_max = np.cos(theta_max_rad)
+    distance_gate_sq = distance_gate**2
+
+    diff = mu2_all[np.newaxis, :, :] - mu1_t_all[:, np.newaxis, :]
+    dist_sq = np.sum(diff**2, axis=2)
+    normal_dots = np.dot(n1_t_all, n2_all.T)
+
+    correspondences = []
+    for i in range(source_points.shape[0]):
+        valid_mask = (dist_sq[i, :] <= distance_gate_sq) & (normal_dots[i, :] >= cos_theta_max)
+        if np.any(valid_mask):
+            valid_indices = np.where(valid_mask)[0]
+            best_j = valid_indices[np.argmin(dist_sq[i, valid_indices])]
+            correspondences.append((i, best_j))
+
+    if len(correspondences) < 3:
+        return np.zeros((3, 3), dtype=float), np.zeros(3, dtype=float), correspondences, 0.0
+
+    sigma2_list = []
+    eigvals2_list = []
+    for j in range(target_points.shape[0]):
+        n2 = target_points[j, 2:]
+        sigma2 = _covariance_from_normal(n2)
+        sigma2_list.append(sigma2)
+        eigvals2_list.append(np.linalg.eigvalsh(sigma2))
+
+    H = np.zeros((3, 3), dtype=float)
+    g = np.zeros(3, dtype=float)
+    total_cost = 0.0
+
+    d_count = float(len(correspondences))
+    R_theta = np.array([[c, -s], [s, c]], dtype=float)
+    for i, j in correspondences:
+        mu1 = source_points[i, :2]
+        n1 = source_points[i, 2:]
+        mu2 = target_points[j, :2]
+        n2 = n2_all[j, :]
+
+        sigma2 = sigma2_list[j]
+        eigvals2 = eigvals2_list[j]
+        p_feat2 = (float(eigvals2[0]), float(eigvals2[1]))
+
+        match cost_function:
+            case "p2p":
+                residual = point_to_point_cost(mu1, mu2, R_theta, t)
+                mu1_t = np.array([c * mu1[0] - s * mu1[1], s * mu1[0] + c * mu1[1]]) + t
+                error_vec = mu1_t - mu2
+                error_norm_sq = np.sum(error_vec**2) + 1e-12
+                error_norm = np.sqrt(error_norm_sq)
+                dR_dtheta_mu = np.array([-s * mu1[0] - c * mu1[1], c * mu1[0] - s * mu1[1]])
+                J = np.array(
+                    [
+                        2 * error_vec[0] / error_norm,
+                        2 * error_vec[1] / error_norm,
+                        2 * float(np.dot(error_vec, dR_dtheta_mu)) / error_norm,
+                    ],
+                    dtype=float,
+                )
+            case "p2l":
+                residual = point_to_line_cost(mu1, mu2, n2, R_theta, t)
+                dR_dtheta_mu = np.array([-s * mu1[0] - c * mu1[1], c * mu1[0] - s * mu1[1]])
+                J = np.array([n2[0], n2[1], float(np.dot(n2, dR_dtheta_mu))], dtype=float)
+            case "p2d":
+                residual = point_to_distribution_cost(mu1, mu2, sigma2, R_theta, t)
+                dR_dtheta_mu = np.array([-s * mu1[0] - c * mu1[1], c * mu1[0] - s * mu1[1]])
+                J = np.array([n2[0], n2[1], float(np.dot(n2, dR_dtheta_mu))], dtype=float)
+            case _:
+                raise ValueError(f"Unknown cost_function: {cost_function}")
+
+        huber_weight = Huber_loss(residual, huber_delta)
+        eigvals1 = np.linalg.eigvalsh(_covariance_from_normal(n1))
+        p_feat1 = (float(eigvals1[0]), float(eigvals1[1]))
+        n1_t = np.array([c * n1[0] - s * n1[1], s * n1[0] + c * n1[1]])
+        w_similarity = combined_weight(p_feat1, p_feat2, d_count, d_count, n1_t, n2)
+        w = huber_weight * w_similarity
+
+        H += w * np.outer(J, J)
+        g += w * J * residual
+        total_cost += w * (residual**2)
+
+    return H, g, correspondences, total_cost
+
+
+def registration_from_oriented_points(
+    oriented_points,
+    keyframes=None,
+    cost_function="p2l",
+    window_size=5,
+    max_iterations=20,
+    return_covariance=False,
+    start_theta=0.0,
+    start_t=np.zeros(2, dtype=float)
+):
     """
-    Estimate rotation and translation using CFEAR-style oriented points.
-    
-    Parameters:
-    -----------
-    oriented_points : list of ndarray or tuple(ndarray, ndarray)
-        If list: ordered scans, each with shape (N, 4) containing (mu_x, mu_y, n_x, n_y).
-        If tuple/list of length 2: register first set to second set.
-    return_covariance : bool
-        If True, return pose covariance estimate from Hessian
+    Register oriented points.
 
-    Returns:
-    --------
-    If two sets are provided:
-        R : ndarray
-            Estimated rotation matrix (2x2)
-        t : ndarray
-            Estimated translation vector (2,)
-        [covariance] : ndarray (optional)
-            3x3 pose covariance if return_covariance=True
-    If a scan list is provided:
-        transforms : list of tuples
-            Pairwise transforms [(R_0_1, t_0_1, [cov_0_1]), ...]
+    Supported modes:
+    1) Pair mode (backward compatible):
+       - oriented_points=(source, target) and keyframes is None
+       - returns transform source -> target
+    2) Keyframe mode (joint optimization):
+       - oriented_points=source and keyframes=[target_0, target_1, ...]
+       - minimizes the summed CFEAR objective over all keyframes.
     """
-    # Pair input: directly estimate one transform.
-    if isinstance(oriented_points, tuple) and len(oriented_points) == 2:
-        result = _register_pair_cfear(
-            oriented_points[0],
-            oriented_points[1],
-            max_iterations=max_iterations,
-            return_covariance=return_covariance,
-            cost_function=cost_function
-        )
-        return result
+    if keyframes is None:
+        if isinstance(oriented_points, tuple) and len(oriented_points) == 2:
+            return _register_pair_cfear(
+                oriented_points[0],
+                oriented_points[1],
+                max_iterations=max_iterations,
+                return_covariance=return_covariance,
+                cost_function=cost_function,
+                start_theta=start_theta,
+                start_t=start_t
+            )
+        if isinstance(oriented_points, list) and len(oriented_points) == 2 and isinstance(oriented_points[0], np.ndarray):
+            return _register_pair_cfear(
+                oriented_points[0],
+                oriented_points[1],
+                max_iterations=max_iterations,
+                return_covariance=return_covariance,
+                cost_function=cost_function,
+                start_theta=start_theta,
+                start_t=start_t
+            )
+        raise ValueError("Provide either (source, target) or set keyframes for multi-keyframe registration.")
 
-    if isinstance(oriented_points, list) and len(oriented_points) == 2 and isinstance(oriented_points[0], np.ndarray):
-        result = _register_pair_cfear(
-            oriented_points[0],
-            oriented_points[1],
-            max_iterations=max_iterations,
-            return_covariance=return_covariance,
-            cost_function=cost_function
-        )
-        return result
-
-    # Scan list input: estimate pairwise transforms and optionally fuse over a local window.
-    if not isinstance(oriented_points, list) or len(oriented_points) < 2:
-        return []
-
-    transforms = []
-    for k in range(len(oriented_points) - 1):
-        result = _register_pair_cfear(
-            oriented_points[k],
-            oriented_points[k + 1],
-            max_iterations=max_iterations,
-            return_covariance=return_covariance,
-            cost_function=cost_function
-        )
+    source = np.asarray(oriented_points, dtype=float)
+    if source.size == 0:
         if return_covariance:
-            R_k, t_k, _, cov_k = result
-            transforms.append((R_k, t_k, cov_k))
-        else:
-            R_k, t_k, _ = result
-            transforms.append((R_k, t_k))
+            return np.eye(2), np.zeros(2), [], np.eye(3) * 1e6
+        return np.eye(2), np.zeros(2), []
 
-    # Simple window smoothing on translation for stability.
-    #TODO: Remove it and implement proper adjustment over the window instead.
-    if window_size > 1 and len(transforms) > 0:
-        smoothed = []
-        for i in range(len(transforms)):
-            start = max(0, i - window_size + 1)
-            if return_covariance:
-                t_stack = np.array([transforms[j][1] for j in range(start, i + 1)])
-                t_mean = np.mean(t_stack, axis=0)
-                smoothed.append((transforms[i][0], t_mean, transforms[i][2]))
-            else:
-                t_stack = np.array([transforms[j][1] for j in range(start, i + 1)])
-                t_mean = np.mean(t_stack, axis=0)
-                smoothed.append((transforms[i][0], t_mean))
-        transforms = smoothed
+    keyframe_list = [np.asarray(kf, dtype=float) for kf in keyframes if kf is not None and len(kf) > 0]
+    if len(keyframe_list) == 0:
+        if return_covariance:
+            return np.eye(2), np.zeros(2), [], np.eye(3) * 1e6
+        return np.eye(2), np.zeros(2), []
 
-    return transforms
+    theta = start_theta
+    t = np.array(start_t, dtype=float, copy=True)  # Ensure writable copy
+    correspondences_all = []
+    last_hessian = np.eye(3, dtype=float) * 1e6
+
+    _ = window_size
+    for _iter in range(max_iterations):
+        H_total = np.zeros((3, 3), dtype=float)
+        g_total = np.zeros(3, dtype=float)
+        correspondences_all = []
+
+        for kf_idx, keyframe in enumerate(keyframe_list):
+            H_kf, g_kf, corr_kf, _ = _build_cfear_normal_equations(
+                source,
+                keyframe,
+                theta,
+                t,
+                cost_function=cost_function,
+            )
+            if len(corr_kf) == 0:
+                continue
+            H_total += H_kf
+            g_total += g_kf
+            correspondences_all.extend((kf_idx, i, j) for i, j in corr_kf)
+
+        if len(correspondences_all) < 3:
+            break
+
+        last_hessian = H_total
+        try:
+            delta = -np.linalg.solve(H_total + 1e-9 * np.eye(3), g_total)
+        except np.linalg.LinAlgError:
+            break
+
+        t += delta[:2]
+        theta += delta[2]
+        if np.linalg.norm(delta) < 1e-4:
+            break
+
+    final_R = _rotation_matrix(theta)
+    if return_covariance:
+        try:
+            covariance = np.linalg.inv(last_hessian + 1e-9 * np.eye(3))
+        except np.linalg.LinAlgError:
+            covariance = np.eye(3) * 1e6
+        return final_R, t, correspondences_all, covariance
+    return final_R, t, correspondences_all
+
 
 def visualize_matches(img1, img2, keypoints1, keypoints2, matches):
     # Visualize the matched keypoints between the two images with different colors for each match

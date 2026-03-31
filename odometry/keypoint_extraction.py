@@ -135,12 +135,13 @@ def Cen2018_keypoints(img, w_median = 5, w_binom = 3, z_min = 0.6):
             # Get indices of local maxima
             peak_indices = np.where(local_max)[0]
             
-            # Add all peaks as keypoints
+            # Add all peaks as keypoints with intensity
             for peak_idx in peak_indices:
-                keypoints.append((a, int(peak_idx)))
+                intensity = y_hat[peak_idx]
+                keypoints.append((a, int(peak_idx), intensity))
     
     print(f"Found {len(keypoints)} keypoints using Cen2018 method")
-    return np.array(keypoints) if len(keypoints) > 0 else np.array([]).reshape(0, 2)
+    return np.array(keypoints) if len(keypoints) > 0 else np.array([]).reshape(0, 3)
 
 def Cen2019_keypoints(H, S, l_max = 500, return_mask = False):
     mask = np.zeros_like(H, dtype=bool) 
@@ -225,10 +226,11 @@ def Cen2019_keypoints(H, S, l_max = 500, return_mask = False):
             if has_neighbor:
                 max_idx = np.argmax([H[a, r] for r in region])
                 best_r = region[max_idx]
-                keypoints.append((int(a), best_r))
+                intensity = H[a, best_r]
+                keypoints.append((int(a), best_r, intensity))
 
     print(f"Found {len(keypoints)} keypoints")
-    keypoints = np.array(keypoints)
+    keypoints = np.array(keypoints) if len(keypoints) > 0 else np.array([]).reshape(0, 3)
 
     if return_mask:
         return keypoints, mask
@@ -238,6 +240,7 @@ def Cen2019_keypoints(H, S, l_max = 500, return_mask = False):
 def k_strongest_keypoints(img, z_min, k=12):
     """
     Extract keypoints, by selecting the k strongest readings per azimuth that exceed a specified intensity threshold z_min.
+    Returns keypoints as (angle, range, intensity) tuples.
     """
     keypoints = []
     for a in range(img.shape[0]):
@@ -247,9 +250,10 @@ def k_strongest_keypoints(img, z_min, k=12):
         # Filter out readings that do not exceed the intensity threshold
         valid_indices = [r for r in strongest_indices if img[a, r] > z_min]
         
-        # Add valid keypoints to the list
+        # Add valid keypoints to the list with intensity
         for r in valid_indices:
-            keypoints.append((a, r))
+            intensity = img[a, r]
+            keypoints.append((a, r, intensity))
     
     return np.array(keypoints)
 
@@ -303,7 +307,7 @@ def hessian_blob_keypoints(img, percentile=99.9, num_keypoints=300, sigma=2.0, i
     
     if len(candidate_coords) == 0:
         print(f"  No keypoints found above threshold {adaptive_threshold:.6f}")
-        return np.array([]).reshape(0, 2)
+        return np.array([]).reshape(0, 3)
     
     print(f"  Found {len(candidate_coords)} candidates before ANMS")
     
@@ -311,7 +315,11 @@ def hessian_blob_keypoints(img, percentile=99.9, num_keypoints=300, sigma=2.0, i
     candidate_responses = hessian_response_abs[candidate_coords[:, 0], candidate_coords[:, 1]]
     
     # Step 5: Apply Adaptive Non-Maximal Suppression (ANMS)
-    keypoints = anms(candidate_coords, candidate_responses, num_keypoints)
+    keypoints_selected = anms(candidate_coords, candidate_responses, num_keypoints)
+    
+    # Add intensity (hessian response) as third column
+    keypoints_intensities = hessian_response_abs[keypoints_selected[:, 0], keypoints_selected[:, 1]]
+    keypoints = np.column_stack([keypoints_selected, keypoints_intensities])
     
     print(f"Found {len(keypoints)} keypoints using Hessian-ANMS method")
     return keypoints
@@ -420,10 +428,12 @@ def orb_keypoints(img, num_keypoints=300):
         r_idx = int(r_norm * (num_ranges - 1))
         
         if 0 <= r_idx < num_ranges:
-            keypoints.append((a_idx, r_idx))
+            # Get intensity from cartesian image at this location
+            intensity = img_cart[int(y_pix), int(x_pix)]
+            keypoints.append((a_idx, r_idx, intensity))
     
     print(f"Found {len(keypoints)} keypoints using ORB method")
-    return np.array(keypoints) if len(keypoints) > 0 else np.array([]).reshape(0, 2)
+    return np.array(keypoints) if len(keypoints) > 0 else np.array([]).reshape(0, 3)
 
 def motion_compensation(keypoints, ego_motion, azimuth_bins=400, delta_T=0.5):
     """Apply motion compensation to keypoints based on ego-motion data.
