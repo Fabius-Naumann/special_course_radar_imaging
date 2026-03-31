@@ -1,9 +1,9 @@
 import sys
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 from scipy.ndimage import binary_closing, binary_opening, label
+from sklearn.cluster import DBSCAN
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -13,13 +13,21 @@ from utils.cfar import CFAR_PFA, cfar2d_polar_ca, suggest_default_params
 from utils.data_loading import _normalize_polar_layout, cartesian_to_polar_image, polar_to_cartesian_image
 
 
-def extract_shoreline(img, min_cluster_area=4, morph_open_k=3, morph_close_k=5, grid_size=4096):
+def extract_shoreline(
+    img,
+    min_cluster_area_m2=64,
+    morph_open_k=3,
+    morph_close_k=7,
+    grid_size=4096,
+    cart_threshold=0.0,
+    polar_threshold=0.5,
+):
     """
     Extract shoreline points from the radar image.
 
     Parameters:
     - img: 2D array of the radar image in polar coordinates.
-    - min_cluster_area: Minimum area (in pixels) for a cluster of detections to be kept.
+    - min_cluster_area_m2: Minimum area (in square meters) for a cluster of detections to be kept.
     - morph_open_k: Structure size for morphological opening (removes isolated noise).
     - morph_close_k: Structure size for morphological closing (fills gaps).
 
@@ -39,30 +47,36 @@ def extract_shoreline(img, min_cluster_area=4, morph_open_k=3, morph_close_k=5, 
     # 2. Polar to Cartesian mask conversion
     # polar_to_cartesian_image manages the transpose automatically via _normalize_polar_layout
     cart_mask_float, x, y = polar_to_cartesian_image(detections.astype(np.float32), grid_size=grid_size)
-    cart_mask = cart_mask_float > 0.0
+    cart_mask = cart_mask_float > cart_threshold
 
     # 3. Morphological filtering in Cartesian
     if morph_close_k > 0:
         struct_close = np.ones((morph_close_k, morph_close_k), dtype=bool)
-        cart_mask = binary_closing(cart_mask, structure=struct_close, iterations=1)
+        cart_mask = binary_closing(cart_mask, structure=struct_close, iterations=2)
 
     if morph_open_k > 0:
         struct_open = np.ones((morph_open_k, morph_open_k), dtype=bool)
         cart_mask = binary_opening(cart_mask, structure=struct_open, iterations=1)
 
+    if morph_close_k > 0:
+        struct_close = np.ones((morph_close_k, morph_close_k), dtype=bool)
+        cart_mask = binary_closing(cart_mask, structure=struct_close, iterations=1)
+
     # Area filtering
-    if min_cluster_area > 0:
+    if min_cluster_area_m2 > 0:
         labeled_mask, n_features = label(cart_mask)
         clean_mask = np.zeros_like(cart_mask)
+        # Convert m^2 to pixel count based on the Cartesian grid resolution
+        min_cluster_area_px = max(1, round(min_cluster_area_m2 / (x[-1] - x[0]) * grid_size))
         for i in range(1, n_features + 1):
-            if (labeled_mask == i).sum() >= min_cluster_area:
+            if (labeled_mask == i).sum() >= min_cluster_area_px:
                 clean_mask[labeled_mask == i] = True
         cart_mask = clean_mask
 
     # 4. Cartesian to Polar mapping
     n_range, n_azimuth = _normalize_polar_layout(img).shape
     polar_mask_normalized = cartesian_to_polar_image(cart_mask.astype(np.float32), polar_shape=(n_range, n_azimuth))
-    polar_mask_normalized = polar_mask_normalized > 0.5
+    polar_mask_normalized = polar_mask_normalized > polar_threshold
 
     # Match original shape
     if img.shape[0] == n_azimuth:  # meaning original was (azimuth, range)
@@ -90,9 +104,29 @@ def extract_shoreline(img, min_cluster_area=4, morph_open_k=3, morph_close_k=5, 
     return shoreline_points, cart_mask, polar_mask
 
 
+def cluster_shoreline_dbscan(cart_x, cart_y, min_samples=5, cut_distance=10, **kwargs):
+    """
+    Cluster shoreline points using DBSCAN.
+
+    Parameters:
+    - cart_x: Array of x coordinates
+    - cart_y: Array of y coordinates
+    - min_samples: Number of samples in a neighborhood for a point to be considered as a core point
+    - cut_distance: Neighborhood radius in Cartesian coordinates (meters)
+
+    Returns:
+    - labels: Cluster labels for each point. Noisy samples are given the label -1.
+    """
+    if len(cart_x) == 0:
+        return np.array([])
+
+    points = np.column_stack((cart_x, cart_y))
+    clusterer = DBSCAN(eps=cut_distance, min_samples=min_samples, **kwargs)
+    return clusterer.fit_predict(points)
+
+
 if __name__ == "__main__":
     from utils.data_loading import load_radar_images, polar_to_cartesian_points
-    from utils.visualisation import _display_or_save
 
     print("Loading radar images...")
     filenames, images = load_radar_images(num_images=1)
@@ -116,55 +150,9 @@ if __name__ == "__main__":
         cart_shoreline_x = pts[:, 0]
         cart_shoreline_y = pts[:, 1]
 
-    # Plotting the results using matplotlib to allow custom overlays
-    # while leveraging the _display_or_save util for backend handling
-    fig, axs = plt.subplots(1, 4, figsize=(24, 6))
+    print("Clustering shoreline points...")
+    cluster_labels = cluster_shoreline_dbscan(cart_shoreline_x, cart_shoreline_y)
 
-    # 1. Original Polar Image with Shoreline
-    axs[0].imshow(img.T if img.shape[1] > img.shape[0] else img, aspect="auto", cmap="viridis", origin="lower")
-    axs[0].set_title("Polar Image with Shoreline")
-    axs[0].set_xlabel("Azimuth Bin")
-    axs[0].set_ylabel("Range Bin")
+    from utils.visualisation import plot_shoreline_extraction
 
-    if shoreline_points:
-        axs[0].scatter(azs, ranges, c="red", s=5, label="Shoreline")
-        axs[0].legend()
-
-    # 2. Cartesian Image with Shoreline Overlay
-    axs[1].imshow(
-        cart_img,
-        extent=[x_coords.min(), x_coords.max(), y_coords.min(), y_coords.max()],
-        origin="lower",
-        cmap="viridis",
-    )
-    axs[1].set_title("Cartesian Image with Shoreline")
-    axs[1].set_xlabel("X (m)")
-    axs[1].set_ylabel("Y (m)")
-
-    if shoreline_points:
-        axs[1].scatter(cart_shoreline_x, cart_shoreline_y, c="red", s=3, label="Shoreline", zorder=5)
-        axs[1].legend()
-
-    # 3. Cartesian Mask
-    axs[2].imshow(
-        cart_mask,
-        extent=[x_coords.min(), x_coords.max(), y_coords.min(), y_coords.max()],
-        aspect="equal",
-        cmap="gray",
-        origin="lower",
-    )
-    axs[2].set_title("Cartesian Mask (Morph. Cleanup)")
-    axs[2].set_xlabel("X (m)")
-
-    # 4. Polar Mask Back-projected
-    axs[3].imshow(
-        polar_mask.T if polar_mask.shape[1] > polar_mask.shape[0] else polar_mask,
-        aspect="auto",
-        cmap="gray",
-        origin="lower",
-    )
-    axs[3].set_title("Back-projected Polar Mask")
-    axs[3].set_xlabel("Azimuth Bin")
-
-    plt.tight_layout()
-    _display_or_save("shoreline_test.png")
+    plot_shoreline_extraction(img, shoreline_points, cart_mask, polar_mask, cluster_labels)
