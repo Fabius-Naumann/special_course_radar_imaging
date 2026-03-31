@@ -435,7 +435,7 @@ def orb_keypoints(img, num_keypoints=300):
     print(f"Found {len(keypoints)} keypoints using ORB method")
     return np.array(keypoints) if len(keypoints) > 0 else np.array([]).reshape(0, 3)
 
-def motion_compensation(keypoints, ego_motion, azimuth_bins=400, delta_T=0.5):
+def motion_compensation(keypoints_polar, ego_motion, azimuth_bins=400, delta_T=0.5):
     """Apply motion compensation to keypoints based on ego-motion data.
     Assume that there is no acceleration.
     ego_motion = (v_x, v_y, theta) - velocity in x and y direction and angular velocity
@@ -454,16 +454,14 @@ def motion_compensation(keypoints, ego_motion, azimuth_bins=400, delta_T=0.5):
         "polar" (default) uses azimuth-dependent time offsets,
         "cartesian" applies a uniform half-scan offset.
     """
-    keypoints = np.asarray(keypoints, dtype=float)
 
-    keypoints_angular = cartesian_to_polar_points(keypoints)
     v_x, v_y, omega = ego_motion
 
     R = np.array([np.cos(-omega), -np.sin(-omega)], [np.sin(-omega), np.cos(-omega)])
-    time_offsets = (keypoints_angular[:,0] - azimuth_bins / 2)* delta_t / 2
+    time_offsets = (keypoints_polar[:,0] - azimuth_bins / 2)* delta_T / 2
 
     compensated_keypoints = []
-    for i, (a, r) in enumerate(keypoints_angular):
+    for i, (a, r) in enumerate(keypoints_polar):
         # Compute the time offset for this keypoint based on its azimuth
         time_offset = time_offsets[i]
 
