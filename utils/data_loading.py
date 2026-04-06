@@ -20,12 +20,16 @@ CSV_FILE_PATH = DATA_DIR / "snowborbus_gps_data.csv"
 
 
 # Transformation functions for radar data
-def polar_to_cartesian_points(ranges, angles, range_resolution=0.155, angle_resolution=2 * np.pi / 400):
+def polar_to_cartesian_points(ranges, angles, range_resolution=0.155, angle_resolution=2 * np.pi / 400, mirror_images=False):
     """
     Convert polar coordinates (ranges and angles) to Cartesian coordinates (x, y) and scaling them according to the resolution.
     """
     x = ranges * range_resolution * np.cos(angles * angle_resolution)
     y = ranges * range_resolution * np.sin(angles * angle_resolution)
+
+    if mirror_images:
+        y = -y  # Mirror the y-axis to flip the image horizontally
+
     points = np.stack((x, y), axis=-1)
 
     return points
@@ -61,7 +65,7 @@ def _normalize_polar_layout(data, data_layout="auto"):
     return data.T if data.shape[1] > data.shape[0] else data
 
 
-def polar_to_cartesian_image(data, theta_range=None, r_range=(0, 1000), grid_size=1024, data_layout="auto"):
+def polar_to_cartesian_image(data, theta_range=None, r_range=(0, 1000), grid_size=1024, data_layout="auto", mirror_images=False):
     """
     Convert radar image from polar to Cartesian coordinates.
 
@@ -119,7 +123,12 @@ def polar_to_cartesian_image(data, theta_range=None, r_range=(0, 1000), grid_siz
         prefilter=False,
     ).reshape(grid_size, grid_size)
 
-    sampled[~valid] = 0
+    sampled[~valid] = 0.0
+
+    if mirror_images:
+        # mirror the image 
+        sampled = np.fliplr(sampled)
+
     return sampled.astype(np.float32), x, y
 
 

@@ -115,7 +115,7 @@ def compute_descriptors(img, keypoints, alpha=18, rho=10, max_radius=50):
 
 #TODO: Check this implementation
 def estimate_oriented_surface_points(keypoints, r=5.0, f=2.0, min_neighbors=6, 
-                                      max_condition_number=1e5, z_min=None):
+                                      max_condition_number=1e5, z_min=None, smoothing = None, sigma=1.0):
     """
     Estimate oriented surface points from keypoints with intensity information.
     
@@ -133,7 +133,11 @@ def estimate_oriented_surface_points(keypoints, r=5.0, f=2.0, min_neighbors=6,
         Maximum allowed covariance condition number
     z_min : float or None
         Minimum intensity used in W_jj = z_j - z_min. If None, uses minimum from keypoints.
-    
+    smoothing : str or None
+        Optional smoothing mode: None, 'gaussian', or 'symmetric'.
+    sigma : float
+        Standard deviation for 3x3 Gaussian kernel generation.
+        
     Returns:
     --------
     oriented_points : ndarray
@@ -144,6 +148,12 @@ def estimate_oriented_surface_points(keypoints, r=5.0, f=2.0, min_neighbors=6,
         raise ValueError(f"Expected keypoints with shape (N, 3), got {keypoints.shape}")
     if keypoints.size == 0:
         return np.empty((0, 4), dtype=float), np.empty((0, 2), dtype=float)
+
+    valid_smoothing = {None, "gaussian", "symmetric"}
+    if smoothing not in valid_smoothing:
+        raise ValueError("smoothing must be one of {None, 'gaussian', 'symmetric'}")
+    if sigma <= 0:
+        raise ValueError("sigma must be > 0")
 
     # Extract positions and intensities
     positions = keypoints[:, :2]  # (N, 2)
@@ -160,8 +170,9 @@ def estimate_oriented_surface_points(keypoints, r=5.0, f=2.0, min_neighbors=6,
             cells[key] = []
         cells[key].append(idx)
     
+    cell_keys = list(cells.keys())
     pd = []
-    for cell_x, cell_y in cells.keys():
+    for cell_x, cell_y in cell_keys:
         cell_center = np.array([(cell_x + 0.5) * grid_size, (cell_y + 0.5) * grid_size], dtype=float)
         pd.append(cell_center)
 
@@ -175,13 +186,13 @@ def estimate_oriented_surface_points(keypoints, r=5.0, f=2.0, min_neighbors=6,
 
     # 2) For each grid center, estimate local distribution from neighbors
     kdtree = cKDTree(positions)
-    oriented_points = []
-    
-    for pi in pd:
+    local_stats = {}
+
+    for (cell_x, cell_y), pi in zip(cell_keys, pd):
         neighbor_ids = np.asarray(kdtree.query_ball_point(pi, r), dtype=int)
         if neighbor_ids.size == 0:
             continue
-        
+
         neighbors = positions[neighbor_ids]
         neighbor_intensities = intensities[neighbor_ids]
 
@@ -201,6 +212,75 @@ def estimate_oriented_surface_points(keypoints, r=5.0, f=2.0, min_neighbors=6,
         centered = neighbors - mu_i
         sigma_i = centered.T @ (weights[:, np.newaxis] * centered)
 
+        local_stats[(cell_x, cell_y)] = {
+            "mu": mu_i,
+            "sigma": sigma_i,
+            "count": int(neighbors.shape[0]),
+        }
+
+    if len(local_stats) == 0:
+        return np.empty((0, 4), dtype=float), pd
+
+    # Classical 3x3 kernel from the paper when sigma is 1.0; otherwise build a 3x3 Gaussian.
+    if np.isclose(sigma, 1.0):
+        base_kernel = (1.0 / 16.0) * np.array(
+            [[1.0, 2.0, 1.0], [2.0, 4.0, 2.0], [1.0, 2.0, 1.0]],
+            dtype=float,
+        )
+    else:
+        offsets = np.array([-1.0, 0.0, 1.0], dtype=float)
+        xx, yy = np.meshgrid(offsets, offsets)
+        base_kernel = np.exp(-(xx**2 + yy**2) / (2.0 * sigma**2))
+        base_kernel /= np.sum(base_kernel)
+
+    def smooth_stats(cell_key):
+        center = local_stats[cell_key]
+        if smoothing is None:
+            return center["mu"], center["sigma"]
+
+        cx, cy = cell_key
+        weighted_kernel = np.zeros((3, 3), dtype=float)
+        neighborhood = {}
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                nk = (cx + dx, cy + dy)
+                if nk not in local_stats:
+                    continue
+                neighbor_stats = local_stats[nk]
+                w = base_kernel[dy + 1, dx + 1] * float(neighbor_stats["count"])
+                weighted_kernel[dy + 1, dx + 1] = w
+                neighborhood[(dy + 1, dx + 1)] = neighbor_stats
+
+        if smoothing == "symmetric":
+            for y in range(3):
+                for x in range(3):
+                    w_ij = weighted_kernel[y, x]
+                    w_sym = weighted_kernel[2 - y, 2 - x]
+                    if (w_ij > 0.0 and w_sym <= 0.0) or (w_ij <= 0.0 and w_sym > 0.0):
+                        return center["mu"], center["sigma"]
+
+        weight_sum = float(np.sum(weighted_kernel))
+        if weight_sum <= 0.0:
+            return center["mu"], center["sigma"]
+
+        weighted_kernel /= weight_sum
+
+        mu_hat = np.zeros(2, dtype=float)
+        second_moment = np.zeros((2, 2), dtype=float)
+        for (y, x), neighbor_stats in neighborhood.items():
+            w = weighted_kernel[y, x]
+            mu = neighbor_stats["mu"]
+            sigma_local = neighbor_stats["sigma"]
+            mu_hat += w * mu
+            second_moment += w * (sigma_local + np.outer(mu, mu))
+
+        sigma_hat = second_moment - np.outer(mu_hat, mu_hat)
+        return mu_hat, sigma_hat
+
+    oriented_points = []
+
+    for cell_key in local_stats:
+        mu_i, sigma_i = smooth_stats(cell_key)
         eigenvalues, eigenvectors = np.linalg.eigh(sigma_i)
         lambda_min = float(eigenvalues[0])
         lambda_max = float(eigenvalues[-1])
