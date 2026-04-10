@@ -193,21 +193,52 @@ def select_matches(matches, Compatibility):
 def point_to_point_cost(mu1, mu2, R, t):
     # Apply rotation and translation to mu1
     mu1_transformed = R @ mu1 + t
-    return np.linalg.norm(mu2 - mu1_transformed)
+    e = mu2 - mu1_transformed
+
+    # Jacobian for P2P
+    e_norm = np.linalg.norm(e) + 1e-12  # Add small epsilon to avoid division by zero
+    dR_dtheta_mu = R @ mu1
+    J = np.array([
+        2 * e[0] / e_norm,
+        2 * e[1] / e_norm,
+        2 * float(np.dot(e, dR_dtheta_mu)) / e_norm
+    ], dtype=float)
+
+    return e_norm, J
 
 def point_to_line_cost(mu1, mu2, n2, R, t):
     """Point-to-line residual using target normal n2. Returns ||n^T · e||^2."""
     mu1_transformed = R @ mu1 + t
     e = mu1_transformed - mu2
     residual = float(n2.T @ e)
-    return residual  # Return signed residual for optimization
 
-def point_to_distribution_cost(mu1, mu2, sigma2, R, t, lambda_damp=0.1):
+    # Compute Jacobian for P2L
+    e_norm = np.linalg.norm(e) + 1e-12
+    dR_dtheta_mu = R @ mu1
+    J = np.array([n2[0], n2[1], float(np.dot(n2, dR_dtheta_mu))], dtype=float)
+
+    return e_norm, J
+
+def point_to_distribution_cost(mu1, mu2, n2, sigma2, R, t, lambda_damp=0.1):
     """Point-to-distribution cost: e^T Σ^-1 e where Σ = (Σ + λI)."""
     mu1_transformed = R @ mu1 + t
     e = mu2 - mu1_transformed
     sigma_damped = sigma2 + lambda_damp * np.eye(sigma2.shape[0])
-    return float(e.T @ np.linalg.inv(sigma_damped) @ e)
+
+    # Jacobian for P2D residual r = e^T Σ^-1 e with e = mu2 - (R @ mu1 + t)
+    sigma_inv = np.linalg.inv(sigma_damped)
+    q = sigma_inv @ e
+    residual = float(e.T @ q)
+
+    # d(R @ mu1)/dtheta for 2D rotation: (Omega @ R) @ mu1 with Omega=[[0,-1],[1,0]]
+    omega = np.array([[0.0, -1.0], [1.0, 0.0]], dtype=float)
+    dR_dtheta_mu = (omega @ R) @ mu1
+
+    dr_dtx = -2.0 * q[0]
+    dr_dty = -2.0 * q[1]
+    dr_dtheta = -2.0 * float(np.dot(q, dR_dtheta_mu))
+    J = np.array([dr_dtx, dr_dty, dr_dtheta], dtype=float)
+    return residual, J
 
 # Loss function
 def Huber_loss(cost, delta):
@@ -226,7 +257,7 @@ def planarity(p):
     return np.log(1.0 + abs(lambda_max / lambda_min))
     
 def similarity(a, b):
-    return 2*min(a, b) / (a + b + 1e-6)  # Add small epsilon to avoid division by zero
+    return 2*min(a, b) / (a + b + 1e-12)  # Add small epsilon to avoid division by zero
 
 def planarity_similarity_weight(p1, p2):
     planarity1 = planarity(p1)
@@ -247,7 +278,6 @@ def combined_weight(p1, p2, d1, d2, n1, n2):
     w_dir = direction_weight(n1, n2)
     return w_plan + w_det + w_dir
 
-
 def _covariance_from_normal(n, sigma_along=2.0, sigma_across=0.15):
     """Build an anisotropic 2D covariance aligned with a surface normal."""
     n = np.asarray(n, dtype=float)
@@ -260,7 +290,6 @@ def _rotation_matrix(theta):
     s = np.sin(theta)
     return np.array([[c, -s], [s, c]], dtype=float)
 
-#TODO: Check this implementation
 def _register_pair_cfear(
     oriented_points1,
     oriented_points2,
@@ -386,28 +415,13 @@ def _register_pair_cfear(
             # Compute residual based on cost function (equations 12-14)
             match cost_function:
                 case "p2p":
-                    residual = point_to_point_cost(mu1, mu2, np.array([[c, -s], [s, c]]), t)
-                    # Jacobian for P2P
-                    mu1_t = np.array([c * mu1[0] - s * mu1[1], s * mu1[0] + c * mu1[1]]) + t
-                    error_vec = mu1_t - mu2
-                    error_norm_sq = np.sum(error_vec**2) + 1e-12
-                    error_norm = np.sqrt(error_norm_sq)
-                    dR_dtheta_mu = np.array([-s * mu1[0] - c * mu1[1], c * mu1[0] - s * mu1[1]])
-                    J = np.array([
-                        2 * error_vec[0] / error_norm,
-                        2 * error_vec[1] / error_norm,
-                        2 * float(np.dot(error_vec, dR_dtheta_mu)) / error_norm
-                    ], dtype=float)
+                    residual, J = point_to_point_cost(mu1, mu2, np.array([[c, -s], [s, c]]), t)
+                    
                 case "p2l":
-                    residual = point_to_line_cost(mu1, mu2, n2, np.array([[c, -s], [s, c]]), t)
-                    # Jacobian for P2L
-                    dR_dtheta_mu = np.array([-s * mu1[0] - c * mu1[1], c * mu1[0] - s * mu1[1]])
-                    J = np.array([n2[0], n2[1], float(np.dot(n2, dR_dtheta_mu))], dtype=float)
+                    residual, J = point_to_line_cost(mu1, mu2, n2, np.array([[c, -s], [s, c]]), t)
+
                 case "p2d":
-                    residual = point_to_distribution_cost(mu1, mu2, sigma2, np.array([[c, -s], [s, c]]), t)
-                    # Jacobian for P2D
-                    dR_dtheta_mu = np.array([-s * mu1[0] - c * mu1[1], c * mu1[0] - s * mu1[1]])
-                    J = np.array([n2[0], n2[1], float(np.dot(n2, dR_dtheta_mu))], dtype=float)
+                    residual, J = point_to_distribution_cost(mu1, mu2, n2, sigma2, np.array([[c, -s], [s, c]]), t)
                 case _:
                     raise ValueError(f"Unknown cost_function: {cost_function}")
 
@@ -538,28 +552,11 @@ def _build_cfear_normal_equations(
 
         match cost_function:
             case "p2p":
-                residual = point_to_point_cost(mu1, mu2, R_theta, t)
-                mu1_t = np.array([c * mu1[0] - s * mu1[1], s * mu1[0] + c * mu1[1]]) + t
-                error_vec = mu1_t - mu2
-                error_norm_sq = np.sum(error_vec**2) + 1e-12
-                error_norm = np.sqrt(error_norm_sq)
-                dR_dtheta_mu = np.array([-s * mu1[0] - c * mu1[1], c * mu1[0] - s * mu1[1]])
-                J = np.array(
-                    [
-                        2 * error_vec[0] / error_norm,
-                        2 * error_vec[1] / error_norm,
-                        2 * float(np.dot(error_vec, dR_dtheta_mu)) / error_norm,
-                    ],
-                    dtype=float,
-                )
+                residual, J = point_to_point_cost(mu1, mu2, R_theta, t)
             case "p2l":
-                residual = point_to_line_cost(mu1, mu2, n2, R_theta, t)
-                dR_dtheta_mu = np.array([-s * mu1[0] - c * mu1[1], c * mu1[0] - s * mu1[1]])
-                J = np.array([n2[0], n2[1], float(np.dot(n2, dR_dtheta_mu))], dtype=float)
+                residual, J = point_to_line_cost(mu1, mu2, n2, R_theta, t)
             case "p2d":
-                residual = point_to_distribution_cost(mu1, mu2, sigma2, R_theta, t)
-                dR_dtheta_mu = np.array([-s * mu1[0] - c * mu1[1], c * mu1[0] - s * mu1[1]])
-                J = np.array([n2[0], n2[1], float(np.dot(n2, dR_dtheta_mu))], dtype=float)
+                residual, J = point_to_distribution_cost(mu1, mu2, n2, sigma2, R_theta, t)
             case _:
                 raise ValueError(f"Unknown cost_function: {cost_function}")
 
@@ -572,7 +569,7 @@ def _build_cfear_normal_equations(
 
         H += w * np.outer(J, J)
         g += w * J * residual
-        total_cost += w * (residual**2)
+        total_cost += w * residual
 
     return H, g, correspondences, total_cost
 

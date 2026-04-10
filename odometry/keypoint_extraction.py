@@ -457,7 +457,7 @@ def motion_compensation(keypoints_polar, ego_motion, azimuth_bins=400, delta_T=0
 
     v_x, v_y, omega = ego_motion
 
-    R = np.array([np.cos(-omega), -np.sin(-omega)], [np.sin(-omega), np.cos(-omega)])
+    R = np.array([[np.cos(-omega), -np.sin(-omega)], [np.sin(-omega), np.cos(-omega)]], dtype=float)
     time_offsets = (keypoints_polar[:,0] - azimuth_bins / 2)* delta_T / 2
 
     compensated_keypoints = []
@@ -469,7 +469,7 @@ def motion_compensation(keypoints_polar, ego_motion, azimuth_bins=400, delta_T=0
         translation = np.array([v_x * time_offset, v_y * time_offset])
 
         # Compute the rotation due to angular motion
-        rotation = R @ keypoints[i]
+        rotation = R @ keypoints_polar[i]
 
         # Apply compensation: first rotate, then translate
         compensated_point = rotation + translation
