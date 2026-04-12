@@ -189,6 +189,19 @@ def select_matches(matches, Compatibility):
     print(f"Selected matches shape: {M.shape}")
     return M
 
+def transform_oriented_points(oriented_points, R, t):
+    # Apply rotation and translation to the point coordinates
+    points = oriented_points[:, :2]  # Extract point coordinates (x, y)
+    normals = oriented_points[:, 2:]  # Extract normal vectors (nx, ny)
+
+    # Rotate points and normals
+    points_transformed = points @ R.T + t  # Apply rotation and translation
+    normals_transformed = normals @ R.T  # Rotate normals only
+
+    # Combine transformed points and normals back into the oriented points format
+    oriented_points_transformed = np.hstack((points_transformed, normals_transformed))
+    return oriented_points_transformed
+
 # Cost functions
 def point_to_point_cost(mu1, mu2, R, t):
     # Apply rotation and translation to mu1

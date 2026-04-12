@@ -435,6 +435,27 @@ def orb_keypoints(img, num_keypoints=300):
     print(f"Found {len(keypoints)} keypoints using ORB method")
     return np.array(keypoints) if len(keypoints) > 0 else np.array([]).reshape(0, 3)
 
+def preprocessing_normalized_azimuths(img):
+    normalized_image = _normalize_azimuth_rows(img)
+    return normalized_image
+
+def preprocessing_cfar(img):
+    # Implementation for CFAR preprocessing
+    CFAR_PFA = 2e-1
+    RANGE_BIN_M = 0.155
+    params = suggest_default_params(range_bin_m=RANGE_BIN_M)
+
+    det_ca, thr_ca, noise_ca, valid_ca = cfar2d_polar_ca(
+            img,
+            **(params | {"normalize_azimuth": True}),
+            range_pad_mode="edge",
+            pfa=CFAR_PFA,
+            min_noise_floor_factor=1.3,
+        )
+
+    img_cfar = img * det_ca
+    return img_cfar
+
 def motion_compensation(keypoints_polar, ego_motion, azimuth_bins=400, delta_T=0.5):
     """Apply motion compensation to keypoints based on ego-motion data.
     Assume that there is no acceleration.
