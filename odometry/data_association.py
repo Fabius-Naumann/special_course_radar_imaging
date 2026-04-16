@@ -581,7 +581,6 @@ def registration_from_oriented_points(
     oriented_points,
     keyframes=None,
     cost_function="p2l",
-    window_size=5,
     max_iterations=20,
     return_covariance=False,
     start_theta=0.0,
@@ -638,7 +637,6 @@ def registration_from_oriented_points(
     correspondences_all = []
     last_hessian = np.eye(3, dtype=float) * 1e6
 
-    _ = window_size
     for _iter in range(max_iterations):
         H_total = np.zeros((3, 3), dtype=float)
         g_total = np.zeros(3, dtype=float)

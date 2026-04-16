@@ -13,6 +13,7 @@ project_root = Path(__file__).resolve().parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 from utils.data_loading import load_radar_images, polar_to_cartesian_image, polar_to_cartesian_points, cartesian_to_polar_points
+from utils.cfar import _normalize_azimuth_rows, cfar2d_polar_ca, suggest_default_params
 
 def compute_H_S(img, return_mag = False):
     # Compute the gradient using the Prewitt operator in both directions
@@ -237,18 +238,45 @@ def Cen2019_keypoints(H, S, l_max = 500, return_mask = False):
     
     return keypoints
 
-def k_strongest_keypoints(img, z_min, k=12):
+def preprocessing_normalized_azimuths(img):
+    normalized_image = _normalize_azimuth_rows(img)
+    return normalized_image
+
+def preprocessing_cfar(img):
+    # Implementation for CFAR preprocessing
+    CFAR_PFA = 2e-1
+    RANGE_BIN_M = 0.155
+    params = suggest_default_params(range_bin_m=RANGE_BIN_M)
+
+    det_ca, thr_ca, noise_ca, valid_ca = cfar2d_polar_ca(
+            img,
+            **(params | {"normalize_azimuth": True}),
+            range_pad_mode="edge",
+            pfa=CFAR_PFA,
+            min_noise_floor_factor=1.3,
+        )
+
+    img_cfar = img * det_ca
+    return img_cfar
+
+def k_strongest_keypoints(img, z_min, k=12, max_distance_percentile=100):
     """
     Extract keypoints, by selecting the k strongest readings per azimuth that exceed a specified intensity threshold z_min.
     Returns keypoints as (angle, range, intensity) tuples.
     """
     keypoints = []
+    max_range = img.shape[1]
+    max_distance = max_range * max_distance_percentile / 100
+
     for a in range(img.shape[0]):
         # Get the indices of the k strongest readings for this angle
         strongest_indices = np.argsort(img[a, :])[-k:]
         
         # Filter out readings that do not exceed the intensity threshold
         valid_indices = [r for r in strongest_indices if img[a, r] > z_min]
+
+        # Filter out readings that are beyond the maximum distance
+        valid_indices = [r for r in valid_indices if r <= max_distance]
         
         # Add valid keypoints to the list with intensity
         for r in valid_indices:
@@ -459,6 +487,8 @@ def motion_compensation(keypoints_polar, ego_motion, azimuth_bins=400, delta_T=0
 
     R = np.array([np.cos(-omega), -np.sin(-omega)], [np.sin(-omega), np.cos(-omega)])
     time_offsets = (keypoints_polar[:,0] - azimuth_bins / 2)* delta_T / 2
+
+    keypoints = polar_to_cartesian_points(ranges=keypoints_polar[:,1], angles=keypoints_polar[:,0])
 
     compensated_keypoints = []
     for i, (a, r) in enumerate(keypoints_polar):
