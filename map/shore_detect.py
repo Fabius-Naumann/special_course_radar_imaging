@@ -9,8 +9,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.cfar import CFAR_PFA, cfar2d_polar_ca, suggest_default_params
-from utils.data_loading import _normalize_polar_layout, cartesian_to_polar_image, polar_to_cartesian_image
+from utils.cfar import CFAR_PFA, cfar2d_polar_ca, suggest_default_params  # noqa: E402
+from utils.data_loading import _normalize_polar_layout, cartesian_to_polar_image, polar_to_cartesian_image  # noqa: E402
 
 
 def extract_shoreline(
@@ -21,6 +21,7 @@ def extract_shoreline(
     grid_size=4096,
     cart_threshold=0.0,
     polar_threshold=0.5,
+    clockwise_azimuth=False,
 ):
     """
     Extract shoreline points from the radar image.
@@ -46,7 +47,11 @@ def extract_shoreline(
 
     # 2. Polar to Cartesian mask conversion
     # polar_to_cartesian_image manages the transpose automatically via _normalize_polar_layout
-    cart_mask_float, x, y = polar_to_cartesian_image(detections.astype(np.float32), grid_size=grid_size)
+    cart_mask_float, x, y = polar_to_cartesian_image(
+        detections.astype(np.float32),
+        grid_size=grid_size,
+        clockwise_azimuth=clockwise_azimuth,
+    )
     cart_mask = cart_mask_float > cart_threshold
 
     # 3. Morphological filtering in Cartesian
@@ -75,7 +80,11 @@ def extract_shoreline(
 
     # 4. Cartesian to Polar mapping
     n_range, n_azimuth = _normalize_polar_layout(img).shape
-    polar_mask_normalized = cartesian_to_polar_image(cart_mask.astype(np.float32), polar_shape=(n_range, n_azimuth))
+    polar_mask_normalized = cartesian_to_polar_image(
+        cart_mask.astype(np.float32),
+        polar_shape=(n_range, n_azimuth),
+        clockwise_azimuth=clockwise_azimuth,
+    )
     polar_mask_normalized = polar_mask_normalized > polar_threshold
 
     # Match original shape
@@ -101,7 +110,7 @@ def extract_shoreline(
             # Append (az_idx, range_idx)
             shoreline_points.append((az, first_range))
 
-    return shoreline_points, cart_mask, polar_mask
+    return shoreline_points, cart_mask, polar_mask, cart_mask_float
 
 
 def cluster_shoreline_dbscan(cart_x, cart_y, min_samples=5, cut_distance=10, **kwargs):
@@ -133,7 +142,7 @@ if __name__ == "__main__":
     img = images[0]
 
     print("Extracting shoreline...")
-    shoreline_points, cart_mask, polar_mask = extract_shoreline(img)
+    shoreline_points, cart_mask, polar_mask, _ = extract_shoreline(img)
 
     print(f"Detected {len(shoreline_points)} shoreline points.")
 
@@ -144,7 +153,7 @@ if __name__ == "__main__":
     cart_shoreline_x = []
     cart_shoreline_y = []
     if shoreline_points:
-        azs, ranges = zip(*shoreline_points)
+        azs, ranges = zip(*shoreline_points, strict=False)
         # polar_to_cartesian_points takes (ranges, angles)
         pts = polar_to_cartesian_points(np.array(ranges), np.array(azs))
         cart_shoreline_x = pts[:, 0]

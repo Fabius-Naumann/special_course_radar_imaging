@@ -138,7 +138,7 @@ def computing_CFEAR_Features(img, preprocessing, k, z_percentile, velocity, r_pa
     ) if motion_compensation_flag else keypoints_polar
 
     # Step 4: Polar to Cartesian Conversion (point-wise for keypoints including intensity)
-    keypoints_xy = polar_to_cartesian_points(keypoints_polar[:, 1], keypoints_polar[:, 0], mirror_images=True)  # (N, 2) with x and y
+    keypoints_xy = polar_to_cartesian_points(keypoints_polar[:, 1], keypoints_polar[:, 0], clockwise_azimuth=True)  # (N, 2) with x and y
     keypoints_cartesian = np.column_stack([keypoints_xy, intensities])  # (N, 3) with x, y, intensity
 
     # Step 5: Oriented Surface Point Estimation 

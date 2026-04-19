@@ -17,7 +17,7 @@ project_root = Path(__file__).resolve().parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from utils.data_loading import extract_timestamp, load_gps_data, load_radar_images, polar_to_cartesian_image
+from utils.data_loading import extract_gps_timeframe, extract_timestamp, load_gps_data, load_radar_images, polar_to_cartesian_image
 from keypoint_extraction import Cen2019_keypoints, compute_H_S
 from data_association import compute_descriptors, unaryMatchesFromDescriptors, compute_pairwiseCompatibilityScore, select_matches
 from motion_estimation import motion_estimation_ransac, motion_estimation_SVD
@@ -319,34 +319,25 @@ def create_stabilized_overlay_video(
 def extract_timeframe(gps_data, timestamps, time_tolerance=0.5):
     """
     Extract GPS data for the timeframe between two timestamps.
-    
+
     Parameters:
     - gps_data: DataFrame containing GPS data with a 'timestamp' column
     - timestamps: List of timestamps for radar images
     - time_tolerance: Time tolerance in seconds
-    
+
     Returns:
     - gps_subset: DataFrame containing GPS data within the specified timeframe
     """
-    gps_subset = pd.DataFrame()
-
-    for t in timestamps:
-        # Convert timestamps to datetime objects
-        radar_time_point = pd.to_datetime(t)
-
-        # Create time window
-        time_window_start = radar_time_point - timedelta(seconds=time_tolerance)
-        time_window_end = radar_time_point #+ timedelta(seconds=time_tolerance)
-
-        # Extract GPS data within the time window
-        subset = gps_data[(gps_data['time-string'] >= time_window_start) & (gps_data['time-string'] <= time_window_end)]
-        if subset.empty:
-            print(f"No GPS data found for timestamp {t} within the time window {time_window_start} - {time_window_end}.")
-        else:
-            gps_subset = pd.concat([gps_subset, subset], ignore_index=True)
-
-    gps_subset = gps_subset.drop_duplicates().reset_index(drop=True)
-    return gps_subset        
+    gps_subset = extract_gps_timeframe(gps_data, timestamps, time_tolerance=time_tolerance)
+    if gps_subset.empty:
+        for timestamp in timestamps:
+            radar_time_point = pd.to_datetime(timestamp)
+            time_window_start = radar_time_point - timedelta(seconds=time_tolerance)
+            print(
+                f"No GPS data found for timestamp {timestamp} "
+                f"within the time window {time_window_start} - {radar_time_point}."
+            )
+    return gps_subset      
 
 def calculate_gps_distance(gps_entry1, gps_entry2):
     """

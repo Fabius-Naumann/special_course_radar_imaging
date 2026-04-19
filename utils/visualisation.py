@@ -4,6 +4,7 @@ from pathlib import Path
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
+from pyproj import Transformer
 
 if __package__ in {None, ""}:
     PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -147,7 +148,15 @@ def plot_radars_side_by_side(images, titles=None, fig_size=5, x=None, y=None, fi
     _display_or_save(filename)
 
 
-def plot_shoreline_extraction(img, shoreline_points, cart_mask, polar_mask, cluster_labels=None, output_path=None):
+def plot_shoreline_extraction(
+    img,
+    shoreline_points,
+    cart_mask,
+    polar_mask,
+    cluster_labels=None,
+    output_path=None,
+    clockwise_azimuth=False,
+):
     """
     Plot the results of shoreline extraction.
     """
@@ -157,13 +166,21 @@ def plot_shoreline_extraction(img, shoreline_points, cart_mask, polar_mask, clus
 
     from utils.data_loading import polar_to_cartesian_image, polar_to_cartesian_points
 
-    cart_img, x_coords, y_coords = polar_to_cartesian_image(img, grid_size=1024)
+    cart_img, x_coords, y_coords = polar_to_cartesian_image(
+        img,
+        grid_size=1024,
+        clockwise_azimuth=clockwise_azimuth,
+    )
 
     cart_shoreline_x = []
     cart_shoreline_y = []
     if shoreline_points:
-        azs, ranges = zip(*shoreline_points)
-        pts = polar_to_cartesian_points(np.array(ranges), np.array(azs))
+        azs, ranges = zip(*shoreline_points, strict=False)
+        pts = polar_to_cartesian_points(
+            np.array(ranges),
+            np.array(azs),
+            clockwise_azimuth=clockwise_azimuth,
+        )
         cart_shoreline_x = pts[:, 0]
         cart_shoreline_y = pts[:, 1]
 
@@ -256,3 +273,89 @@ def plot_shoreline_extraction(img, shoreline_points, cart_mask, polar_mask, clus
         plt.close(fig)
     else:
         _display_or_save("shoreline_test.png")
+
+
+def local_xy_to_web_mercator(local_xy_m, center_lat, center_lon, heading_deg):
+    """Transform local radar XY points (meters) into EPSG:3857 coordinates."""
+    local_xy_m = np.asarray(local_xy_m, dtype=float)
+    if local_xy_m.ndim != 2 or local_xy_m.shape[1] != 2:
+        raise ValueError("local_xy_m must have shape (N, 2)")
+
+    to_merc = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+    center_x, center_y = to_merc.transform(float(center_lon), float(center_lat))
+
+    heading_math_rad = np.radians(90.0 - float(heading_deg))
+    c, s = np.cos(heading_math_rad), np.sin(heading_math_rad)
+    rotation = np.array([[c, -s], [s, c]], dtype=float)
+
+    rotated = local_xy_m @ rotation.T
+    rotated[:, 0] += center_x
+    rotated[:, 1] += center_y
+    return rotated
+
+
+def plot_radar_overlay_on_osm_static(
+    center_lat,
+    center_lon,
+    heading_deg,
+    output_path,
+    shoreline_xy=None,
+    cart_mask=None,
+    max_range_m=1000.0,
+    title="Radar Shoreline on OSM",
+):
+    """Plot radar shoreline and optional Cartesian mask on static OpenStreetMap basemap."""
+    try:
+        import contextily as ctx
+    except ImportError as error:
+        raise ImportError("contextily is required for static OSM plotting") from error
+
+    fig, ax = plt.subplots(figsize=(9, 9))
+
+    all_x = []
+    all_y = []
+
+    if cart_mask is not None:
+        mask = np.asarray(cart_mask, dtype=bool)
+        if mask.ndim != 2:
+            raise ValueError("cart_mask must be a 2D array")
+
+        y_coords = np.linspace(-float(max_range_m), float(max_range_m), mask.shape[0], dtype=float)
+        x_coords = np.linspace(-float(max_range_m), float(max_range_m), mask.shape[1], dtype=float)
+        x_grid, y_grid = np.meshgrid(x_coords, y_coords)
+
+        local_grid = np.column_stack((x_grid.ravel(), y_grid.ravel()))
+        world_grid = local_xy_to_web_mercator(local_grid, center_lat, center_lon, heading_deg)
+        world_x = world_grid[:, 0].reshape(mask.shape)
+        world_y = world_grid[:, 1].reshape(mask.shape)
+
+        ax.contourf(world_x, world_y, mask.astype(float), levels=[0.5, 1.5], alpha=0.45, colors=["royalblue"])
+        all_x.extend([float(np.min(world_x)), float(np.max(world_x))])
+        all_y.extend([float(np.min(world_y)), float(np.max(world_y))])
+
+    if shoreline_xy is not None:
+        shoreline_xy = np.asarray(shoreline_xy, dtype=float)
+        if shoreline_xy.ndim == 2 and shoreline_xy.shape[0] > 0:
+            shoreline_world = local_xy_to_web_mercator(shoreline_xy, center_lat, center_lon, heading_deg)
+            ax.scatter(shoreline_world[:, 0], shoreline_world[:, 1], s=6, c="red", alpha=0.85)
+            all_x.extend([float(np.min(shoreline_world[:, 0])), float(np.max(shoreline_world[:, 0]))])
+            all_y.extend([float(np.min(shoreline_world[:, 1])), float(np.max(shoreline_world[:, 1]))])
+
+    radar_center = local_xy_to_web_mercator(np.array([[0.0, 0.0]]), center_lat, center_lon, heading_deg)[0]
+    ax.scatter(radar_center[0], radar_center[1], c="gold", s=60, marker="*", edgecolors="black", linewidths=0.5)
+    all_x.append(float(radar_center[0]))
+    all_y.append(float(radar_center[1]))
+
+    if all_x and all_y:
+        x_min, x_max = min(all_x), max(all_x)
+        y_min, y_max = min(all_y), max(all_y)
+        pad = 60.0
+        ax.set_xlim(x_min - pad, x_max + pad)
+        ax.set_ylim(y_min - pad, y_max + pad)
+
+    ctx.add_basemap(ax, crs="EPSG:3857", source=ctx.providers.OpenStreetMap.Mapnik)
+    ax.set_title(title)
+    ax.set_axis_off()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)

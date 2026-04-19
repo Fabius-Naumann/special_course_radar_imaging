@@ -13,10 +13,24 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from map.shore_detect import cluster_shoreline_dbscan, extract_shoreline
-from utils import RESULTS_DIR
-from utils.data_loading import FOLDER_PATH, correct_black_lines, polar_to_cartesian_points
-from utils.visualisation import plot_shoreline_extraction
+from map.shore_detect import cluster_shoreline_dbscan, extract_shoreline  # noqa: E402
+from utils import RESULTS_DIR  # noqa: E402
+from utils.data_loading import (  # noqa: E402
+    FOLDER_PATH,
+    correct_black_lines,
+    extract_timestamp,
+    interpolate_gps_pose,
+    load_gps_data,
+    offset_latlon_by_local_offsets,
+    polar_indices_to_cartesian,
+)
+from utils.visualisation import plot_radar_overlay_on_osm_static, plot_shoreline_extraction  # noqa: E402
+
+GPS_TO_RADAR_OFFSET_M = -9
+GPS_TO_RADAR_LATERAL_OFFSET_M = 0.0
+HEADING_CORRECTION_DEG = 0.0
+RADAR_MAX_RANGE_M = 2000.0
+AZIMUTH_CLOCKWISE = True
 
 
 def parse_args():
@@ -85,16 +99,22 @@ def main():
         "min_cluster_area": args.min_cluster_area,
         "morph_open_k": args.morph_open_k,
         "morph_close_k": args.morph_close_k,
+        "heading_correction_deg": HEADING_CORRECTION_DEG,
+        "gps_lateral_offset_m": GPS_TO_RADAR_LATERAL_OFFSET_M,
+        "gps_to_radar_forward_offset_m": GPS_TO_RADAR_OFFSET_M,
+        "azimuth_clockwise": AZIMUTH_CLOCKWISE,
         "correct_black_lines": args.correct_black_lines,
         "total_available_images": total_available,
         "selected_indices": selected_indices,
     }
 
-    with open(run_root / "run_config.json", "w", encoding="utf-8") as config_file:
+    with (run_root / "run_config.json").open("w", encoding="utf-8") as config_file:
         json.dump(run_config, config_file, indent=2)
 
     print(f"Run directory: {run_root}")
     print(f"Selected {len(selected_indices)} image(s) out of {total_available} available.")
+
+    gps_data = load_gps_data()
 
     summary_rows = []
     for image_index in selected_indices:
@@ -103,23 +123,37 @@ def main():
         if args.correct_black_lines:
             img = correct_black_lines(img)
 
-        shoreline_points, cart_mask, polar_mask = extract_shoreline(
+        shoreline_points, cart_mask, polar_mask, cart_mask_float = extract_shoreline(
             img,
             min_cluster_area_m2=args.min_cluster_area,
             morph_open_k=args.morph_open_k,
             morph_close_k=args.morph_close_k,
             grid_size=args.grid_size,
+            clockwise_azimuth=AZIMUTH_CLOCKWISE,
         )
 
         if shoreline_points:
-            azimuth_indices, range_indices = zip(*shoreline_points)
-            cart_points = polar_to_cartesian_points(np.array(range_indices), np.array(azimuth_indices))
+            azimuth_indices, range_indices = zip(*shoreline_points, strict=False)
+
+            n_range_bins = img.shape[1] if img.shape[1] > img.shape[0] else img.shape[0]
+            n_azimuth_bins = img.shape[0] if img.shape[1] > img.shape[0] else img.shape[1]
+
+            cart_points = polar_indices_to_cartesian(
+                np.array(range_indices),
+                np.array(azimuth_indices),
+                n_range_bins=n_range_bins,
+                n_azimuth_bins=n_azimuth_bins,
+                max_range_m=RADAR_MAX_RANGE_M,
+                clockwise_azimuth=AZIMUTH_CLOCKWISE,
+            )
             cluster_labels = cluster_shoreline_dbscan(cart_points[:, 0], cart_points[:, 1])
         else:
+            cart_points = np.empty((0, 2), dtype=float)
             cluster_labels = np.array([])
 
         image_stem = image_path.stem
         image_plot_name = f"img_{image_index:05d}_{image_stem}_shoreline.png"
+        map_plot_name = f"img_{image_index:05d}_{image_stem}_shoreline_osm.png"
         points_name = f"img_{image_index:05d}_{image_stem}_shoreline_points.csv"
 
         plot_shoreline_extraction(
@@ -129,12 +163,46 @@ def main():
             polar_mask,
             cluster_labels=cluster_labels,
             output_path=image_dir / image_plot_name,
+            clockwise_azimuth=AZIMUTH_CLOCKWISE,
         )
 
-        with open(points_dir / points_name, "w", newline="", encoding="utf-8") as points_file:
+        with (points_dir / points_name).open("w", newline="", encoding="utf-8") as points_file:
             writer = csv.writer(points_file)
             writer.writerow(["azimuth_idx", "range_idx"])
             writer.writerows(shoreline_points)
+
+        map_plot_relpath = ""
+        try:
+            image_timestamp = extract_timestamp(image_path.name)
+            pose = interpolate_gps_pose(gps_data, image_timestamp)
+
+            if pose is not None:
+                corrected_heading_deg = (pose["bearing"] + HEADING_CORRECTION_DEG) % 360.0
+                radar_lat, radar_lon = offset_latlon_by_local_offsets(
+                    pose["latitude"],
+                    pose["longitude"],
+                    heading_deg=corrected_heading_deg,
+                    forward_m=GPS_TO_RADAR_OFFSET_M,
+                    lateral_m=GPS_TO_RADAR_LATERAL_OFFSET_M,
+                )
+
+                map_output_path = image_dir / map_plot_name
+                plot_radar_overlay_on_osm_static(
+                    center_lat=radar_lat,
+                    center_lon=radar_lon,
+                    heading_deg=corrected_heading_deg,
+                    output_path=map_output_path,
+                    shoreline_xy=cart_points,
+                    cart_mask=cart_mask_float,
+                    max_range_m=RADAR_MAX_RANGE_M,
+                    title=(
+                        f"{image_path.name} | heading={corrected_heading_deg:.1f}° "
+                        f"(corr={HEADING_CORRECTION_DEG:+.1f}°)"
+                    ),
+                )
+                map_plot_relpath = f"images/{map_plot_name}"
+        except Exception as error:
+            print(f"Skipping OSM map for {image_path.name}: {error}")
 
         summary_rows.append(
             {
@@ -143,16 +211,17 @@ def main():
                 "shoreline_points": len(shoreline_points),
                 "image_plot": f"images/{image_plot_name}",
                 "points_csv": f"shoreline_points/{points_name}",
+                "map_plot": map_plot_relpath,
             }
         )
 
         print(f"Processed {image_index:05d}: {image_path.name} -> {len(shoreline_points)} shoreline points")
 
-    with open(run_root / "summary.json", "w", encoding="utf-8") as summary_json_file:
+    with (run_root / "summary.json").open("w", encoding="utf-8") as summary_json_file:
         json.dump(summary_rows, summary_json_file, indent=2)
 
-    with open(run_root / "summary.csv", "w", newline="", encoding="utf-8") as summary_csv_file:
-        fieldnames = ["image_index", "image_filename", "shoreline_points", "image_plot", "points_csv"]
+    with (run_root / "summary.csv").open("w", newline="", encoding="utf-8") as summary_csv_file:
+        fieldnames = ["image_index", "image_filename", "shoreline_points", "image_plot", "points_csv", "map_plot"]
         writer = csv.DictWriter(summary_csv_file, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(summary_rows)
