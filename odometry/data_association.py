@@ -303,6 +303,14 @@ def _rotation_matrix(theta):
     s = np.sin(theta)
     return np.array([[c, -s], [s, c]], dtype=float)
 
+
+def _lm_gain_ratio(cost_old, cost_new, H, g, delta, eps=1e-12):
+    """Compute LM gain ratio rho = actual_reduction / predicted_reduction."""
+    pred = -float(g @ delta + 0.5 * delta @ H @ delta)
+    if pred <= eps:
+        return -np.inf
+    return float((cost_old - cost_new) / pred)
+
 def _register_pair_cfear(
     oriented_points1,
     oriented_points2,
@@ -313,7 +321,12 @@ def _register_pair_cfear(
     cost_function="p2l",  # "p2p", "p2l", or "p2d"
     return_covariance=False,
     start_theta=0.0,
-    start_t=np.zeros(2, dtype=float)
+    start_t=np.zeros(2, dtype=float),
+    lm_lambda_init=1e-2,
+    lm_lambda_min=1e-9,
+    lm_lambda_max=1e6,
+    lm_rho_accept=1e-3,
+    grad_tol=1e-6,
 ):
     """
     Register two oriented point sets using CFEAR-3 approach.
@@ -345,6 +358,7 @@ def _register_pair_cfear(
     correspondences = []
     theta_max_rad = np.deg2rad(theta_max_deg)
     last_hessian = np.eye(3, dtype=float) * 1e6
+    lm_lambda = float(lm_lambda_init)
     
     # Precompute covariances and eigenvalues for set 2 (constant during iterations)
     n_points2 = oriented_points2.shape[0]
@@ -410,6 +424,7 @@ def _register_pair_cfear(
         # Optimize: vectorized computation of residuals and Jacobians
         H = np.zeros((3, 3), dtype=float)
         g = np.zeros(3, dtype=float)
+        total_cost = 0.0
         
         num_corr = len(correspondences)
         d_count = float(num_corr)
@@ -452,17 +467,46 @@ def _register_pair_cfear(
 
             H += w * np.outer(J, J)
             g += w * J * residual
+            total_cost += w * (residual**2)
 
         last_hessian = H
 
-        # Solve for incremental update
-        try:
-            delta = -np.linalg.solve(H + 1e-9 * np.eye(3), g)
-        except np.linalg.LinAlgError:
+        if np.linalg.norm(g, ord=np.inf) < grad_tol:
             break
 
-        t += delta[:2]
-        theta += delta[2]
+        # Trust-region Levenberg-Marquardt update
+        damping_diag = np.maximum(np.diag(H), 1e-12)
+        H_lm = H + lm_lambda * np.diag(damping_diag)
+        try:
+            delta = -np.linalg.solve(H_lm, g)
+        except np.linalg.LinAlgError:
+            lm_lambda = min(lm_lambda * 10.0, lm_lambda_max)
+            continue
+
+        trial_t = t + delta[:2]
+        trial_theta = theta + delta[2]
+
+        _, _, corr_trial, trial_cost = _build_cfear_normal_equations(
+            oriented_points1,
+            oriented_points2,
+            trial_theta,
+            trial_t,
+            cost_function=cost_function,
+            distance_gate=distance_gate,
+            theta_max_deg=theta_max_deg,
+            huber_delta=huber_delta,
+        )
+
+        rho = _lm_gain_ratio(total_cost, trial_cost, H, g, delta)
+        if np.isfinite(rho) and rho > lm_rho_accept:
+            t = trial_t
+            theta = trial_theta
+            correspondences = corr_trial
+            if rho > 0.75:
+                lm_lambda = max(0.5 * lm_lambda, lm_lambda_min)
+        else:
+            lm_lambda = min(2.0 * lm_lambda, lm_lambda_max)
+            continue
 
         if np.linalg.norm(delta) < 1e-4:
             break
@@ -494,6 +538,13 @@ def _build_cfear_normal_equations(
 ):
     source_points = np.asarray(source_points, dtype=float)
     target_points = np.asarray(target_points, dtype=float)
+
+    # Accept single-point inputs shaped as (D,) by promoting them to (1, D).
+    if source_points.ndim == 1:
+        source_points = source_points.reshape(1, -1)
+    if target_points.ndim == 1:
+        target_points = target_points.reshape(1, -1)
+
     if source_points.size == 0 or target_points.size == 0:
         return np.zeros((3, 3), dtype=float), np.zeros(3, dtype=float), [], 0.0
 
@@ -591,11 +642,15 @@ def registration_from_oriented_points(
     oriented_points,
     keyframes=None,
     cost_function="p2l",
-    window_size=5,
     max_iterations=20,
     return_covariance=False,
     start_theta=0.0,
-    start_t=np.zeros(2, dtype=float)
+    start_t=np.zeros(2, dtype=float),
+    lm_lambda_init=1e-2,
+    lm_lambda_min=1e-9,
+    lm_lambda_max=1e6,
+    lm_rho_accept=1e-3,
+    grad_tol=1e-6,
 ):
     """
     Register oriented points.
@@ -617,7 +672,12 @@ def registration_from_oriented_points(
                 return_covariance=return_covariance,
                 cost_function=cost_function,
                 start_theta=start_theta,
-                start_t=start_t
+                start_t=start_t,
+                lm_lambda_init=lm_lambda_init,
+                lm_lambda_min=lm_lambda_min,
+                lm_lambda_max=lm_lambda_max,
+                lm_rho_accept=lm_rho_accept,
+                grad_tol=grad_tol,
             )
         if isinstance(oriented_points, list) and len(oriented_points) == 2 and isinstance(oriented_points[0], np.ndarray):
             return _register_pair_cfear(
@@ -627,7 +687,12 @@ def registration_from_oriented_points(
                 return_covariance=return_covariance,
                 cost_function=cost_function,
                 start_theta=start_theta,
-                start_t=start_t
+                start_t=start_t,
+                lm_lambda_init=lm_lambda_init,
+                lm_lambda_min=lm_lambda_min,
+                lm_lambda_max=lm_lambda_max,
+                lm_rho_accept=lm_rho_accept,
+                grad_tol=grad_tol,
             )
         raise ValueError("Provide either (source, target) or set keyframes for multi-keyframe registration.")
 
@@ -647,15 +712,16 @@ def registration_from_oriented_points(
     t = np.array(start_t, dtype=float, copy=True)  # Ensure writable copy
     correspondences_all = []
     last_hessian = np.eye(3, dtype=float) * 1e6
+    lm_lambda = float(lm_lambda_init)
 
-    _ = window_size
     for _iter in range(max_iterations):
         H_total = np.zeros((3, 3), dtype=float)
         g_total = np.zeros(3, dtype=float)
+        total_cost = 0.0
         correspondences_all = []
 
         for kf_idx, keyframe in enumerate(keyframe_list):
-            H_kf, g_kf, corr_kf, _ = _build_cfear_normal_equations(
+            H_kf, g_kf, corr_kf, cost = _build_cfear_normal_equations(
                 source,
                 keyframe,
                 theta,
@@ -666,19 +732,53 @@ def registration_from_oriented_points(
                 continue
             H_total += H_kf
             g_total += g_kf
+            total_cost += cost
             correspondences_all.extend((kf_idx, i, j) for i, j in corr_kf)
 
         if len(correspondences_all) < 3:
             break
 
         last_hessian = H_total
-        try:
-            delta = -np.linalg.solve(H_total + 1e-9 * np.eye(3), g_total)
-        except np.linalg.LinAlgError:
+        if np.linalg.norm(g_total, ord=np.inf) < grad_tol:
             break
 
-        t += delta[:2]
-        theta += delta[2]
+        damping_diag = np.maximum(np.diag(H_total), 1e-12)
+        H_lm = H_total + lm_lambda * np.diag(damping_diag)
+        try:
+            delta = -np.linalg.solve(H_lm, g_total)
+        except np.linalg.LinAlgError:
+            lm_lambda = min(lm_lambda * 10.0, lm_lambda_max)
+            continue
+
+        trial_t = t + delta[:2]
+        trial_theta = theta + delta[2]
+
+        trial_cost_total = 0.0
+        corr_trial_all = []
+        for kf_idx, keyframe in enumerate(keyframe_list):
+            _, _, corr_kf_trial, cost_kf_trial = _build_cfear_normal_equations(
+                source,
+                keyframe,
+                trial_theta,
+                trial_t,
+                cost_function=cost_function,
+            )
+            if len(corr_kf_trial) == 0:
+                continue
+            trial_cost_total += cost_kf_trial
+            corr_trial_all.extend((kf_idx, i, j) for i, j in corr_kf_trial)
+
+        rho = _lm_gain_ratio(total_cost, trial_cost_total, H_total, g_total, delta)
+        if np.isfinite(rho) and rho > lm_rho_accept:
+            t = trial_t
+            theta = trial_theta
+            correspondences_all = corr_trial_all
+            if rho > 0.75:
+                lm_lambda = max(0.5 * lm_lambda, lm_lambda_min)
+        else:
+            lm_lambda = min(2.0 * lm_lambda, lm_lambda_max)
+            continue
+
         if np.linalg.norm(delta) < 1e-4:
             break
 

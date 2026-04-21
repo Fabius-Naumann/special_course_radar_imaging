@@ -18,6 +18,7 @@ else:
 # Folder and file paths to the radar images and GPS data
 FOLDER_PATH = DATA_DIR / "_radar_data_b_scan_image"
 CSV_FILE_PATH = DATA_DIR / "snowborbus_gps_data.csv"
+IMU_FILE_PATH = DATA_DIR / "_ouster_imu" / "imu_data_copy.csv"
 
 
 # Transformation functions for radar data
@@ -454,6 +455,10 @@ def load_gps_data(csv_file_path=CSV_FILE_PATH):
     gps_data["time-string"] = pd.to_datetime(gps_data["time-string"])
     return gps_data
 
+def load_imu_data(csv_file_path=IMU_FILE_PATH):
+    imu_data = pd.read_csv(csv_file_path)
+    imu_data["timestamp"] = pd.to_datetime(imu_data["timestamp"])
+    return imu_data
 
 # Add function which corrects the blank space in radar images
 def correct_black_lines(image, min_black_line_width=50):

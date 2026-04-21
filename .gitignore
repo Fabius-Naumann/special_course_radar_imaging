@@ -4,3 +4,5 @@
 # own folders
 data/**
 results/**
+.venv/
+outputs/**

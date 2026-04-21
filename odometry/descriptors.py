@@ -10,6 +10,7 @@ project_root = Path(__file__).resolve().parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 from utils.data_loading import polar_to_cartesian_points
+from keypoint_extraction import k_strongest_keypoints, motion_compensation, preprocessing_cfar, preprocessing_normalized_azimuths
 
 def compute_descriptors(img, keypoints, alpha=18, rho=10, max_radius=50):
     """
@@ -335,6 +336,54 @@ def estimate_oriented_surface_points(keypoints, r=5.0, f=2.0, min_neighbors=6,
         return np.empty((0, 4), dtype=float), pd
 
     return np.asarray(oriented_points, dtype=float), pd
+
+def computing_CFEAR_Features(img, preprocessing, k, z_percentile, max_distance_percentile, velocity, r_param, f_param, motion_compensation_flag=False, smoothing=None):
+    # Step 1: Preprocessing
+    if preprocessing == "normalized_azimuths":
+        img_preprocessed = preprocessing_normalized_azimuths(img)
+    elif preprocessing == "cfar":
+        img_preprocessed = preprocessing_cfar(img)
+    else:
+        img_preprocessed = img
+
+    # Step 2: Keypoint Extraction
+    z_min_local = np.percentile(img_preprocessed, z_percentile)
+    keypoints = k_strongest_keypoints(img_preprocessed, z_min=z_min_local, k=k, max_distance_percentile=max_distance_percentile)
+    if keypoints.size == 0:
+        return np.empty((0, 4), dtype=float)
+    
+    # keypoints shape: (N, 3) -> (angle, range, intensity)
+    keypoints_polar = keypoints[:, :2]  # (N, 2) with angle and range
+    intensities = keypoints[:, 2]      # (N,) intensities
+
+    # Step 3: Motion Compensation in Polar coordinates (optional)
+    keypoints_compensated = motion_compensation(
+        keypoints_polar, velocity
+    ) if motion_compensation_flag else keypoints_polar
+
+    # Step 4: Polar to Cartesian Conversion (point-wise for keypoints including intensity)
+    keypoints_xy = polar_to_cartesian_points(keypoints_polar[:, 1], keypoints_polar[:, 0], mirror_points=True)  # (N, 2) with x and y
+    keypoints_cartesian = np.column_stack([keypoints_xy, intensities])  # (N, 3) with x, y, intensity
+
+    # Step 5: Oriented Surface Point Estimation 
+    oriented_points, _ = estimate_oriented_surface_points(
+        keypoints_cartesian, r=r_param, f=f_param, smoothing=smoothing
+    )
+
+    return oriented_points
+
+def transform_oriented_points(oriented_points, R, t):
+    # Apply rotation and translation to the point coordinates
+    points = oriented_points[:, :2]  # Extract point coordinates (x, y)
+    normals = oriented_points[:, 2:]  # Extract normal vectors (nx, ny)
+
+    # Rotate points and normals
+    points_transformed = points @ R.T + t  # Apply rotation and translation
+    normals_transformed = normals @ R.T  # Rotate normals only
+
+    # Combine transformed points and normals back into the oriented points format
+    oriented_points_transformed = np.hstack((points_transformed, normals_transformed))
+    return oriented_points_transformed
 
 def orb_descriptor(img, keypoints):
     """
