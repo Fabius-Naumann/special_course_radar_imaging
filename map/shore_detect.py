@@ -10,7 +10,91 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils.cfar import CFAR_PFA, cfar2d_polar_ca, suggest_default_params  # noqa: E402
-from utils.data_loading import _normalize_polar_layout, cartesian_to_polar_image, polar_to_cartesian_image  # noqa: E402
+from utils.data_loading import (  # noqa: E402
+    _normalize_polar_layout,
+    cartesian_to_polar_image,
+    polar_to_cartesian_image,
+    polar_to_cartesian_points,
+)
+
+
+def _build_shoreline_metadata(
+    shoreline_points,
+    cart_points,
+    cluster_labels,
+    min_segment_points=5,
+    min_segment_length_m=20.0,
+):
+    """Compute per-point segment ids, arc lengths, and quality weights."""
+    num_points = len(shoreline_points)
+    if num_points == 0:
+        return {
+            "cart_points": np.empty((0, 2), dtype=float),
+            "cluster_labels": np.empty((0,), dtype=int),
+            "segment_ids": np.empty((0,), dtype=int),
+            "arc_lengths_m": np.empty((0,), dtype=float),
+            "segment_lengths_m": np.empty((0,), dtype=float),
+            "quality_weights": np.empty((0,), dtype=float),
+            "valid_mask": np.empty((0,), dtype=bool),
+        }
+
+    cluster_labels = np.asarray(cluster_labels, dtype=int)
+    cart_points = np.asarray(cart_points, dtype=float)
+    azimuth_indices = np.asarray([point[0] for point in shoreline_points], dtype=int)
+
+    segment_ids = np.full(num_points, -1, dtype=int)
+    arc_lengths = np.zeros(num_points, dtype=float)
+    segment_lengths = np.zeros(num_points, dtype=float)
+    quality_weights = np.full(num_points, 0.05, dtype=float)
+
+    next_segment_id = 0
+    unique_labels = [label for label in sorted(set(cluster_labels.tolist())) if label >= 0]
+    for label_value in unique_labels:
+        member_indices = np.where(cluster_labels == label_value)[0]
+        if member_indices.size == 0:
+            continue
+
+        ordered = member_indices[np.argsort(azimuth_indices[member_indices])]
+        if ordered.size > 1:
+            diffs = np.linalg.norm(np.diff(cart_points[ordered], axis=0), axis=1)
+            segment_length_m = float(np.sum(diffs))
+            local_spacing = np.full(ordered.size, np.inf, dtype=float)
+            local_spacing[0] = diffs[0]
+            local_spacing[-1] = diffs[-1]
+            if ordered.size > 2:
+                local_spacing[1:-1] = 0.5 * (diffs[:-1] + diffs[1:])
+            local_density = 1.0 / np.maximum(local_spacing, 1.0)
+            local_density /= max(float(np.max(local_density)), 1.0)
+            arc = np.zeros(ordered.size, dtype=float)
+            arc[1:] = np.cumsum(diffs)
+        else:
+            segment_length_m = 0.0
+            local_density = np.ones(ordered.size, dtype=float)
+            arc = np.zeros(ordered.size, dtype=float)
+
+        size_quality = min(1.0, ordered.size / max(float(min_segment_points * 2), 1.0))
+        length_quality = min(1.0, segment_length_m / max(float(min_segment_length_m * 2.0), 1.0))
+        cluster_quality = 0.5 * local_density + 0.25 * size_quality + 0.25 * length_quality
+
+        if ordered.size >= int(min_segment_points) and segment_length_m >= float(min_segment_length_m):
+            segment_ids[ordered] = next_segment_id
+            next_segment_id += 1
+            quality_weights[ordered] = np.clip(cluster_quality, 0.2, 1.0)
+        else:
+            quality_weights[ordered] = np.clip(0.15 * cluster_quality, 0.01, 0.15)
+
+        arc_lengths[ordered] = arc
+        segment_lengths[ordered] = segment_length_m
+
+    return {
+        "cart_points": cart_points,
+        "cluster_labels": cluster_labels,
+        "segment_ids": segment_ids,
+        "arc_lengths_m": arc_lengths,
+        "segment_lengths_m": segment_lengths,
+        "quality_weights": quality_weights,
+        "valid_mask": segment_ids >= 0,
+    }
 
 
 def extract_shoreline(
@@ -22,6 +106,11 @@ def extract_shoreline(
     cart_threshold=0.0,
     polar_threshold=0.5,
     clockwise_azimuth=False,
+    cluster_min_samples=5,
+    cluster_cut_distance_m=10.0,
+    min_segment_points=5,
+    min_segment_length_m=20.0,
+    return_metadata=False,
 ):
     """
     Extract shoreline points from the radar image.
@@ -110,7 +199,34 @@ def extract_shoreline(
             # Append (az_idx, range_idx)
             shoreline_points.append((az, first_range))
 
-    return shoreline_points, cart_mask, polar_mask, cart_mask_float
+    if not return_metadata:
+        return shoreline_points, cart_mask, polar_mask, cart_mask_float
+
+    if shoreline_points:
+        azimuth_indices, range_indices = zip(*shoreline_points, strict=False)
+        cart_points = polar_to_cartesian_points(
+            np.asarray(range_indices, dtype=float),
+            np.asarray(azimuth_indices, dtype=float),
+            clockwise_azimuth=clockwise_azimuth,
+        )
+        cluster_labels = cluster_shoreline_dbscan(
+            cart_points[:, 0],
+            cart_points[:, 1],
+            min_samples=cluster_min_samples,
+            cut_distance=cluster_cut_distance_m,
+        )
+    else:
+        cart_points = np.empty((0, 2), dtype=float)
+        cluster_labels = np.empty((0,), dtype=int)
+
+    metadata = _build_shoreline_metadata(
+        shoreline_points,
+        cart_points,
+        cluster_labels,
+        min_segment_points=min_segment_points,
+        min_segment_length_m=min_segment_length_m,
+    )
+    return shoreline_points, cart_mask, polar_mask, cart_mask_float, metadata
 
 
 def cluster_shoreline_dbscan(cart_x, cart_y, min_samples=5, cut_distance=10, **kwargs):

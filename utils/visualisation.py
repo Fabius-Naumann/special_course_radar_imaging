@@ -359,3 +359,176 @@ def plot_radar_overlay_on_osm_static(
     fig.tight_layout()
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
+
+
+def _plot_pose_arrow(ax, pose, color, label, arrow_length_m=60.0):
+    direction = np.array([np.cos(float(pose.yaw_rad)), np.sin(float(pose.yaw_rad))], dtype=float)
+    ax.arrow(
+        float(pose.x),
+        float(pose.y),
+        float(direction[0] * arrow_length_m),
+        float(direction[1] * arrow_length_m),
+        width=1.5,
+        head_width=8.0,
+        head_length=10.0,
+        color=color,
+        length_includes_head=True,
+        zorder=6,
+    )
+    ax.scatter([pose.x], [pose.y], c=color, s=36, label=label, zorder=7)
+
+
+def _plot_covariance_ellipse(ax, center_xy, covariance_xy, color="black", n_std=2.0):
+    covariance_xy = np.asarray(covariance_xy, dtype=float)
+    if covariance_xy.shape != (2, 2) or not np.all(np.isfinite(covariance_xy)):
+        return
+
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance_xy)
+    if np.any(eigenvalues <= 0.0):
+        return
+
+    angle = np.degrees(np.arctan2(eigenvectors[1, 1], eigenvectors[0, 1]))
+    width, height = 2.0 * n_std * np.sqrt(eigenvalues)
+
+    ellipse = matplotlib.patches.Ellipse(
+        xy=center_xy,
+        width=float(width),
+        height=float(height),
+        angle=float(angle),
+        edgecolor=color,
+        facecolor="none",
+        linewidth=1.5,
+        linestyle="--",
+        zorder=5,
+    )
+    ax.add_patch(ellipse)
+
+
+def plot_shoreline_registration_result(
+    coastline_map,
+    point_set,
+    prior_pose,
+    registration_result,
+    output_path,
+    title="Shoreline Registration",
+):
+    """Plot coastline registration diagnostics in the local map frame."""
+    from map.shoreline_registration import transform_points_local_to_world
+
+    point_set_points = np.asarray(point_set.points, dtype=float)
+    prior_world = transform_points_local_to_world(point_set_points, prior_pose)
+    corrected_world = np.asarray(registration_result.transformed_points, dtype=float)
+    inlier_mask = np.asarray(registration_result.inlier_mask, dtype=bool)
+    if inlier_mask.shape != (point_set_points.shape[0],):
+        inlier_mask = np.zeros(point_set_points.shape[0], dtype=bool)
+
+    fig, ax = plt.subplots(figsize=(9, 9))
+
+    for line in coastline_map.local_lines:
+        line = np.asarray(line, dtype=float)
+        if line.ndim == 2 and line.shape[0] > 1:
+            ax.plot(line[:, 0], line[:, 1], color="steelblue", linewidth=1.2, alpha=0.8, zorder=1)
+
+    if coastline_map.sampled_points.shape[0] > 0:
+        ax.scatter(
+            coastline_map.sampled_points[:, 0],
+            coastline_map.sampled_points[:, 1],
+            s=4,
+            c="lightsteelblue",
+            alpha=0.35,
+            zorder=1,
+        )
+
+    if prior_world.shape[0] > 0:
+        ax.scatter(
+            prior_world[:, 0],
+            prior_world[:, 1],
+            s=16,
+            c="darkorange",
+            alpha=0.45,
+            label="Prior transformed points",
+            zorder=2,
+        )
+
+    if corrected_world.shape[0] > 0:
+        outlier_mask = ~inlier_mask
+        if np.any(outlier_mask):
+            ax.scatter(
+                corrected_world[outlier_mask, 0],
+                corrected_world[outlier_mask, 1],
+                s=18,
+                c="crimson",
+                marker="x",
+                linewidths=0.8,
+                alpha=0.85,
+                label="Rejected points",
+                zorder=4,
+            )
+        if np.any(inlier_mask):
+            ax.scatter(
+                corrected_world[inlier_mask, 0],
+                corrected_world[inlier_mask, 1],
+                s=18,
+                c="forestgreen",
+                alpha=0.9,
+                label="Inlier points",
+                zorder=5,
+            )
+
+    _plot_pose_arrow(ax, prior_pose, color="darkorange", label="Prior pose")
+    _plot_pose_arrow(ax, registration_result.estimated_pose, color="forestgreen", label="Corrected pose")
+    if getattr(registration_result, "covariance", None) is not None:
+        _plot_covariance_ellipse(
+            ax,
+            center_xy=(registration_result.estimated_pose.x, registration_result.estimated_pose.y),
+            covariance_xy=np.asarray(registration_result.covariance, dtype=float)[:2, :2],
+            color="black",
+        )
+
+    if getattr(registration_result, "coarse_hypotheses", None):
+        coarse_positions = np.array(
+            [[hyp.pose.x, hyp.pose.y] for hyp in registration_result.coarse_hypotheses],
+            dtype=float,
+        )
+        ax.scatter(
+            coarse_positions[:, 0],
+            coarse_positions[:, 1],
+            s=28,
+            facecolors="none",
+            edgecolors="black",
+            linewidths=1.0,
+            label="Coarse hypotheses",
+            zorder=3,
+        )
+
+    text_lines = [
+        f"success={registration_result.success}",
+        f"confidence={registration_result.confidence:.2f}",
+        f"inliers={registration_result.inlier_count}",
+        f"inlier_ratio={registration_result.inlier_ratio:.2f}",
+        f"mean_residual={registration_result.mean_abs_residual_m:.2f} m",
+        f"observability={registration_result.observability}",
+    ]
+    if registration_result.rejection_reason:
+        text_lines.append(f"reason={registration_result.rejection_reason}")
+
+    ax.text(
+        0.02,
+        0.98,
+        "\n".join(text_lines),
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        fontsize=10,
+        bbox={"facecolor": "white", "alpha": 0.85, "edgecolor": "0.7"},
+    )
+
+    ax.set_title(title)
+    ax.set_xlabel("Local east (m)")
+    ax.set_ylabel("Local north (m)")
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.2)
+    ax.legend(loc="lower right", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
