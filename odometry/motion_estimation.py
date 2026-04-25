@@ -63,6 +63,9 @@ def motion_estimation_SVD(matches, kp1, kp2):
     points1 = polar_to_cartesian_points(matched_kp1[:, 1], matched_kp1[:, 0])  # Convert (angle, range) to (x, y)
     points2 = polar_to_cartesian_points(matched_kp2[:, 1], matched_kp2[:, 0])  # Convert (angle, range) to (x, y)
 
+    if points1.size == 0 or points2.size == 0:
+        raise ValueError("motion_estimation_SVD requires at least one matched point")
+
     # Compute centroids
     centroid_1 = np.mean(points1, axis=0)
     centroid_2 = np.mean(points2, axis=0)

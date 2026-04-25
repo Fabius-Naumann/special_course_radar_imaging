@@ -116,10 +116,13 @@ def _check_input_image(img):
 def _normalize_azimuth_rows(img):
     """Normalize each azimuth row by its mean or median to mitigate large-scale
     variations in antenna pattern or scene structure. This is optional and not part of the core CFAR logic."""
-    row_medians = np.median(img, axis=1, keepdims=True)
-    # Compute median over nonzero values in each row
-    row_medians = np.array([np.median(row[row != 0]) for row in img]).reshape(-1, 1)
-    row_medians[row_medians == 0] = 1.0  # Avoid division by zero
+    # Compute the median over nonzero values in each row, falling back to 1.0
+    # when a row is entirely zero so normalization stays well-defined.
+    row_medians = np.array([
+        float(np.median(row[row != 0])) if np.any(row != 0) else 1.0
+        for row in img
+    ], dtype=np.float32).reshape(-1, 1)
+    row_medians[~np.isfinite(row_medians) | (row_medians == 0)] = 1.0
     normalized = img / row_medians
     return normalized.astype(np.float32, copy=False)
 

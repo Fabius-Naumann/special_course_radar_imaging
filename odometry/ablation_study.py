@@ -1,7 +1,6 @@
 import os
 import sys
-import cv2
-import matplotlib.pyplot as plt
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from datetime import datetime
 from pathlib import Path
@@ -11,17 +10,18 @@ from time import perf_counter
 import pandas as pd
 import numpy as np
 
+from sklearn.cluster import DBSCAN
+
 if __package__ in {None, ""}:
     PROJECT_ROOT = Path(__file__).resolve().parents[1]
     if str(PROJECT_ROOT) not in sys.path:
         sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils.data_loading import extract_timestamp, load_gps_data, load_radar_images
-from descriptors import computing_CFEAR_Features
+from descriptors import computing_CFEAR_Features, transform_oriented_points
 from data_association import (
     ICP_registration,
     registration_from_oriented_points,
-    transform_oriented_points,
 )
 from evaluation import (
     calculate_gps_distance,
@@ -34,12 +34,15 @@ DEFAULT_ODOMETRY_PARAMS = {
     "preprocessing": "normalized_azimuths",
     "k": 25,
     "z_percentile": 99.5,
+    "max_distance_percentile": 75,
     "r_param": 5.0,
     "f_param": 1.0,
     "cost_function": "p2p",
     "ICP": False,
     "window_size": 3,
     "motion_compensation_flag": True,
+    "every_nth_frame": 1,
+    "max_iterations": 10,
 }
 
 def ablation_study(
@@ -52,6 +55,7 @@ def ablation_study(
     sample_mode="first",
     random_seed=42,
     verbose=True,
+    n_jobs=1,
     ):
     """
     Run a grid-search-style ablation and return ranked results plus best params.
@@ -78,6 +82,9 @@ def ablation_study(
         Seed used when sample_mode="random".
     verbose : bool
         If True, prints progress for each parameter combination.
+    n_jobs : int
+        Number of parallel workers used to evaluate parameter combinations.
+        Use 1 for sequential execution, -1 to use all available CPU cores.
     """
     if not isinstance(param_grid, dict) or not param_grid:
         raise ValueError("param_grid must be a non-empty dictionary")
@@ -100,6 +107,13 @@ def ablation_study(
     if score_reducer not in reducers:
         raise ValueError(f"score_reducer must be one of {list(reducers.keys())}")
 
+    if not isinstance(n_jobs, int) or n_jobs == 0:
+        raise ValueError("n_jobs must be an integer and not equal to 0")
+    if n_jobs == -1:
+        n_jobs = os.cpu_count() or 1
+    if n_jobs < -1:
+        raise ValueError("n_jobs must be -1 or a positive integer")
+
     keys = list(param_grid.keys())
     all_combos = list(product(*[param_grid[k] for k in keys]))
 
@@ -119,9 +133,7 @@ def ablation_study(
     else:
         combos = all_combos
 
-    rows = []
-
-    for idx, combo in enumerate(combos, start=1):
+    def evaluate_one(combo):
         params = dict(zip(keys, combo))
         t0 = perf_counter()
 
@@ -144,22 +156,38 @@ def ablation_study(
             status = f"failed: {type(exc).__name__}: {exc}"
 
         runtime_s = perf_counter() - t0
-        rows.append(
-            {
-                **params,
-                "score": float(score),
-                "score_column": score_column,
-                "score_reducer": score_reducer,
-                "runtime_s": float(runtime_s),
-                "status": status,
-            }
-        )
+        return {
+            **params,
+            "score": float(score),
+            "score_column": score_column,
+            "score_reducer": score_reducer,
+            "runtime_s": float(runtime_s),
+            "status": status,
+        }
 
-        if verbose:
-            print(
-                f"[{idx}/{len(combos)}] {params} -> "
-                f"score={score:.4f}, status={status}, runtime={runtime_s:.2f}s"
-            )
+    rows = []
+    if n_jobs == 1:
+        for idx, combo in enumerate(combos, start=1):
+            row = evaluate_one(combo)
+            rows.append(row)
+            if verbose:
+                params = {k: row[k] for k in keys}
+                print(
+                    f"[{idx}/{len(combos)}] {params} -> "
+                    f"score={row['score']:.4f}, status={row['status']}, runtime={row['runtime_s']:.2f}s"
+                )
+    else:
+        with ThreadPoolExecutor(max_workers=n_jobs) as executor:
+            futures = {executor.submit(evaluate_one, combo): combo for combo in combos}
+            for completed, future in enumerate(as_completed(futures), start=1):
+                row = future.result()
+                rows.append(row)
+                if verbose:
+                    params = {k: row[k] for k in keys}
+                    print(
+                        f"[{completed}/{len(combos)}] {params} -> "
+                        f"score={row['score']:.4f}, status={row['status']}, runtime={row['runtime_s']:.2f}s"
+                    )
 
     summary_df = pd.DataFrame(rows).sort_values(
         by=["score", "runtime_s"],
@@ -183,14 +211,43 @@ def run_experiment(images, image_files, gps_data, **params):
         preprocessing=config["preprocessing"],
         k=config["k"],
         z_percentile=config["z_percentile"],
+        max_distance_percentile=config["max_distance_percentile"],
         r_param=config["r_param"],
         f_param=config["f_param"],
         cost_function=config["cost_function"],
         ICP=config["ICP"],
         window_size=config["window_size"],
         motion_compensation_flag=config["motion_compensation_flag"],
+        every_nth_frame=config["every_nth_frame"],
+        max_iterations=config["max_iterations"],
     )
     return odometry_results
+
+def filter_lonely_points(oriented_points, eps=0.5, min_samples=2):
+    oriented_points = ensure_oriented_points_array(oriented_points)
+    if oriented_points.shape[0] == 0 or oriented_points.shape[1] < 2:
+        return np.empty((0, max(2, oriented_points.shape[1])), dtype=float)
+
+    xy = oriented_points[:, :2]
+    clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(xy)
+    labels = clustering.labels_
+
+    # Keep points that are in clusters (label != -1)
+    filtered_points = oriented_points[labels != -1]
+    return filtered_points
+
+
+def ensure_oriented_points_array(oriented_points):
+    arr = np.asarray(oriented_points, dtype=float)
+    if arr.size == 0:
+        return np.empty((0, 2), dtype=float)
+
+    if arr.ndim == 1:
+        if arr.shape[0] < 2:
+            return np.empty((0, 2), dtype=float)
+        arr = arr.reshape(1, -1)
+
+    return arr
 
 def main_odometry(
     images,
@@ -199,6 +256,7 @@ def main_odometry(
     preprocessing,
     k,
     z_percentile,
+    max_distance_percentile,
     r_param,
     f_param,
     cost_function,
@@ -206,13 +264,16 @@ def main_odometry(
     window_size,
     motion_compensation_flag,
     every_nth_frame=1,
+    max_iterations=50,
     print_lines=False,
-    plot_map=False,
     smoothing=None,
-    iterations=20,
-    output_dir="odometry",
-    filename_suffix="ablation",
+    clustering=None,
 ):
+    n_images = min(len(images), len(image_files))
+    if n_images == 0:
+        raise ValueError("No images/image_files provided.")
+    if every_nth_frame <= 0:
+        raise ValueError("every_nth_frame must be a positive integer.")
     
     """Initialization of results storage"""
     odometry_results = pd.DataFrame(
@@ -241,15 +302,13 @@ def main_odometry(
     t_1_f = np.zeros(2, dtype=float)
     used_images = []
     heading_offset_deg = 0.0
-    oriented_points_map = []
-    frames_map = []
 
-    n_images = min(len(images), len(image_files))
     i = 0
 
     while len(oriented_points1) == 0:
         if print_lines : print("Computing CFEAR features for the first image...")
-        oriented_points1 = computing_CFEAR_Features(images[i], preprocessing, k, z_percentile, [0, 0, 0], r_param, f_param, motion_compensation_flag=False, smoothing=smoothing)
+        oriented_points1 = computing_CFEAR_Features(images[i], preprocessing, k, z_percentile, max_distance_percentile, [0, 0, 0], r_param, f_param, motion_compensation_flag=False, smoothing=smoothing)
+        oriented_points1 = ensure_oriented_points_array(oriented_points1)
 
         if len(oriented_points1) == 0:
             if print_lines : print("No oriented points extracted from the first image, skipping that image...")
@@ -270,7 +329,7 @@ def main_odometry(
                 initial_theta_deg = 0.0
                 if print_lines : print("Warning: initial GPS bearing is NaN; using 0.0° for initialization.")
             else:
-                initial_theta_deg = 90.0 - initial_bearing_compass
+                initial_theta_deg = 135.0 - initial_bearing_compass
 
             heading_offset_deg = float(initial_theta_deg)
 
@@ -281,23 +340,26 @@ def main_odometry(
             ], dtype=float)
 
             # Add that data to the odometry results dataframe
-            first_row = pd.DataFrame([
-                {
-                    "timestamp": timestamp,
-                    "rotation_deg": float(initial_theta_deg),
-                    "translation_x_m": 0.0,
-                    "translation_y_m": 0.0,
-                    "longitude": float(gps_df["longitude"].values[0]),
-                    "latitude": float(gps_df["latitude"].values[0]),
-                    "velocity_x_m_s": 0.0,
-                    "velocity_y_m_s": 0.0,
-                    "velocity_theta_deg_s": 0.0,
-                    "pos_fault_m": 0.0,
-                }
-            ])
-            odometry_results = pd.concat([odometry_results, first_row], ignore_index=True)
+            first_row = {
+                "timestamp": timestamp,
+                "rotation_deg": float(initial_theta_deg),
+                "translation_x_m": 0.0,
+                "translation_y_m": 0.0,
+                "longitude": float(gps_df["longitude"].values[0]),
+                "latitude": float(gps_df["latitude"].values[0]),
+                "velocity_x_m_s": 0.0,
+                "velocity_y_m_s": 0.0,
+                "velocity_theta_deg_s": 0.0,
+                "pos_fault_m": 0.0,
+            }
+            odometry_results.loc[len(odometry_results)] = first_row
             timestamps.append(timestamp)
             used_images.append(images[i])
+
+            # Filter the oriented points of the first frame to remove lonely points
+            if clustering is True:
+                oriented_points1 = filter_lonely_points(oriented_points1, eps=r_param, min_samples=2)
+                if print_lines : print(f"After filtering lonely points, {len(oriented_points1)} oriented points remain in the first frame.")
 
             # Always add the first successfully processed frame as the initial keyframe
             keyframes.append(oriented_points1)
@@ -307,31 +369,40 @@ def main_odometry(
 
             i += 1
 
-    for img in range(i, n_images):
-        if every_nth_frame > 1 and img % every_nth_frame != 0:
-            continue
-
-        """Compute the features of the current frame"""
+    for img in range(i, n_images, every_nth_frame):
+        """Compute the features of the current frame""" 
         # Extract the velocity from the DataFrame for motion compensation in the current frame
         velocity = (
             float(odometry_results["velocity_x_m_s"].values[-1]),
             float(odometry_results["velocity_y_m_s"].values[-1]),
             float(odometry_results["velocity_theta_deg_s"].values[-1]),
         )
+        if abs(velocity[2]) > 2.0:
+            if print_lines : print(f"Warning: high angular velocity {velocity[2]:.2f} deg/s detected in the last odometry result; capping it to 2.0 deg/s")
+            velocity = (velocity[0], velocity[1], 0.0)
 
         # Computing CFEAR features for the current image
         if print_lines : print(f"Processing image {img+1}/{n_images}...")
-        oriented_points2 = computing_CFEAR_Features(images[img], preprocessing, k, z_percentile, velocity, r_param, f_param, motion_compensation_flag=motion_compensation_flag, smoothing=smoothing)
+        oriented_points2 = computing_CFEAR_Features(images[img], preprocessing, k, z_percentile, max_distance_percentile, velocity, r_param, f_param, motion_compensation_flag=motion_compensation_flag, smoothing=smoothing)
+        oriented_points2 = ensure_oriented_points_array(oriented_points2)
 
         if print_lines : print(f"Extracted {len(oriented_points2)} oriented surface points from image {img+1}.")
         if len(oriented_points2) == 0:
             if print_lines : print(f"No oriented points extracted from image {img+1}, skipping registration.")
             continue
 
-        curr_timestamp = extract_timestamp(image_files[img])
+        # Initial guess based on last pose and last velocity
 
-        # Initial guess from last estimated absolute pose in frame-1 coordinates
-        initial_theta = np.radians(0.0)  # Start with zero rotation as the initial guess
+        # Compute time difference dt between the current frame and the previous frame
+        curr_timestamp = extract_timestamp(image_files[img])
+        prev_timestamp = str(odometry_results["timestamp"].values[-1])
+
+        t_prev = datetime.fromisoformat(prev_timestamp)
+        t_curr = datetime.fromisoformat(curr_timestamp)
+
+        dt = (t_curr - t_prev).total_seconds()
+        
+        initial_theta = np.radians(float(odometry_results["rotation_deg"].values[-1]) - heading_offset_deg + (float(velocity[2]) * dt))
         initial_t = np.array(
             [
                 float(odometry_results["translation_x_m"].values[-1]),
@@ -339,31 +410,16 @@ def main_odometry(
             ],
             dtype=float,
         )
+        initial_t += np.array([velocity[0], velocity[1]]) * dt
 
-        # TODO: Debug Initial guess estimated from last pose and velocity
-        prev_timestamp = str(odometry_results["timestamp"].values[-1])
-        try:
-            t_prev = datetime.fromisoformat(prev_timestamp)
-            t_curr = datetime.fromisoformat(curr_timestamp)
-            dt = (t_curr - t_prev).total_seconds()
-        except Exception:
-            dt = 0.5
-
-        prev_pos = np.array([
-            float(odometry_results["translation_x_m"].values[-1]),
-            float(odometry_results["translation_y_m"].values[-1]),
-        ], dtype=float)
-
-        velocity_arr = np.array(velocity, dtype = float)
-        initial_t = prev_pos + velocity_arr[:2]*dt
-        initial_theta = velocity_arr[2]*dt
+        if print_lines : print(f"Initial guess for registration: rotation (degrees): {np.degrees(initial_theta + np.radians(heading_offset_deg)):.2f}, translation (meters): ({initial_t[0]:.2f}, {initial_t[1]:.2f})")
 
         """Registration and Pose Estimation"""
         # Multi-keyframe mode returns a single absolute transform in the keyframe map coordinates.
         # Because keyframes are already stored in frame-1 coordinates, this is directly current -> frame-1.
         R_f_kf, t_f_kf, correspondences, cov = registration_from_oriented_points(
             oriented_points2, keyframes, cost_function=cost_function, return_covariance=True,
-            start_theta=initial_theta, start_t=initial_t, max_iterations=iterations
+            start_theta=initial_theta, start_t=initial_t, max_iterations=max_iterations
         )
 
         if len(correspondences) == 0:
@@ -423,6 +479,7 @@ def main_odometry(
 
         # Transform current oriented points into frame-1 coordinate system
         oriented_points2_T = transform_oriented_points(oriented_points2, R_1_f, t_1_f)
+        oriented_points2_T = ensure_oriented_points_array(oriented_points2_T)
 
         # Estimate longitude and latitude for the current frame from last known position
         last_longitude = float(odometry_results["longitude"].values[-1])
@@ -439,7 +496,11 @@ def main_odometry(
         gps_entry_curr = {"latitude": float(latitude), "longitude": float(longitude)}
         keyframe_distance_m = calculate_gps_distance(gps_entry_kf, gps_entry_curr)
 
-        if keyframe_distance_m > 1.5:
+        if keyframe_distance_m > 1.0:
+            # Filter the oriented points of the current frame to remove lonely points before adding as a new keyframe
+            if clustering is True:
+                oriented_points2_T = filter_lonely_points(oriented_points2_T, eps=r_param, min_samples=2)
+                if print_lines : print(f"After filtering lonely points, {len(oriented_points2_T)} oriented points remain in the current frame.")
             keyframes.append(oriented_points2_T)
             last_kf_latitude = float(latitude)
             last_kf_longitude = float(longitude)
@@ -450,6 +511,10 @@ def main_odometry(
         else:
             if print_lines : print(f"Image {img+1} not added as a keyframe")
 
+        prev_pos = np.array([
+            float(odometry_results["translation_x_m"].values[-1]),
+            float(odometry_results["translation_y_m"].values[-1]),
+        ], dtype=float)
         step_xy = t_1_f - prev_pos
         step_theta = ((theta_deg - prev_theta_deg + 180.0) % 360.0) - 180.0
 
@@ -477,66 +542,25 @@ def main_odometry(
             print("-" * 50)
 
         # Append current frame to odometry results
-        current_row = pd.DataFrame([
-            {
-                "timestamp": curr_timestamp,
-                "rotation_deg": theta_deg,
-                "translation_x_m": float(t_1_f[0]),
-                "translation_y_m": float(t_1_f[1]),
-                "longitude": float(longitude),
-                "latitude": float(latitude),
-                "velocity_x_m_s": float(velocity[0]),
-                "velocity_y_m_s": float(velocity[1]),
-                "velocity_theta_deg_s": float(velocity[2]),
-                "pos_fault_m": float(position_error),
-            }
-        ])
-        odometry_results = pd.concat([odometry_results, current_row], ignore_index=True)
+        current_row = {
+            "timestamp": curr_timestamp,
+            "rotation_deg": theta_deg,
+            "translation_x_m": float(t_1_f[0]),
+            "translation_y_m": float(t_1_f[1]),
+            "longitude": float(longitude),
+            "latitude": float(latitude),
+            "velocity_x_m_s": float(velocity[0]),
+            "velocity_y_m_s": float(velocity[1]),
+            "velocity_theta_deg_s": float(velocity[2]),
+            "pos_fault_m": float(position_error),
+        }
+        odometry_results.loc[len(odometry_results)] = current_row
         timestamps.append(curr_timestamp)
         used_images.append(images[img])
-
-        # create images for visualization map from the current oriented points and the estimated pose
-        if plot_map:
-            fig, ax = plt.subplots(figsize=(8, 8))
-            ax.set_title(f"Oriented Points Map - Image {img+1}")
-            if len(oriented_points_map) > 0:
-                past_points = np.vstack(oriented_points_map)
-                ax.scatter(past_points[:, 0], past_points[:, 1], s=5, c="red", label="Previous Oriented Points")
-            if len(oriented_points2_T) > 0:
-                ax.scatter(oriented_points2_T[:, 0], oriented_points2_T[:, 1], s=5, c="blue", label="Current Oriented Points")
-            ax.legend()
-            fig.canvas.draw()
-            frame = np.array(fig.canvas.renderer.buffer_rgba())
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
-            frames_map.append(frame_bgr)
-            plt.close(fig)
-
-            oriented_points_map.append(oriented_points2_T.copy())
-            
-
+  
         # Switch the current oriented points to previous for the next iteration
         oriented_points1 = oriented_points2
-    
-    if plot_map:
-        if len(frames_map) > 0:
-            file_name = f"odometry_map_video_{filename_suffix}.mp4"
-            os.makedirs(output_dir, exist_ok=True)
-            out_dir = os.path.join(output_dir,file_name)
-            h, w = frames_map[0].shape[:2]
-            writer = cv2.VideoWriter(
-                out_dir,
-                cv2.VideoWriter_fourcc(*"mp4v"),
-                1.0,
-                (w, h),
-                True,
-            )
-            for frame in frames_map:
-                if frame.shape[0] != h or frame.shape[1] != w:
-                    frame = cv2.resize(frame, (w, h))
-                writer.write(frame)
-            writer.release()
 
-            if print_lines : print(f"Map visualization video saved to: {out_dir}")
 
     return odometry_results, timestamps, used_images
 
@@ -544,17 +568,18 @@ def main_odometry(
 param_grid = {
     "preprocessing": ["normalized_azimuths", "cfar"],
     "k": [12, 25, 40],
+    "max_distance_percentile": [100],
     "r_param": [3.0, 5.0, 8.0],
     "f_param": [1.0, 2.0],
     "cost_function": ["p2p", "p2l", "p2d"],
-    "system": ["cartesian"],
-    "ICP": [True, False],
+    "ICP": [False],
     "z_percentile": [99.0, 99.5],
     "window_size": [1, 3, 5],
     "motion_compensation_flag": [True, False],
+    "every_nth_frame": [1, 2, 3],
 }
 
-n_images = 90
+n_images = 120
 dataset = 1
 
 PROJECT_DIR = Path(__file__).parent.parent
@@ -578,12 +603,13 @@ if __name__ == "__main__":
         param_grid=param_grid,
         run_experiment=lambda **p: run_experiment(images=images, image_files=image_files, gps_data=gps_data, **p),
         score_column="pos_fault_m",
-        score_reducer="mean",
+        score_reducer="p90",
         lower_is_better=True,
-        max_runs=30,
+        max_runs=50,
         sample_mode="random",
         random_seed=42,
         verbose=True,
+        n_jobs=-1,
     )
 
     print(summary.head(10))

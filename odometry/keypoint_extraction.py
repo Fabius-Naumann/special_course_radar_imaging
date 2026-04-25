@@ -16,13 +16,23 @@ from utils.data_loading import load_radar_images, polar_to_cartesian_image, pola
 from utils.cfar import _normalize_azimuth_rows, cfar2d_polar_ca, suggest_default_params
 
 def compute_H_S(img, return_mag = False):
+    if img.size == 0:
+        empty = np.asarray(img, dtype=float)
+        if return_mag:
+            return empty, empty, empty
+        return empty, empty
+
     # Compute the gradient using the Prewitt operator in both directions
     prewitt_range = prewitt(img, axis=1)
     prewitt_angle = prewitt(img, axis=0)
 
     # Compute the magnitude of the gradient and normalize it
     prewitt_mag = np.sqrt(prewitt_range**2 + prewitt_angle**2)
-    prewitt_mag_norm = prewitt_mag / np.max(prewitt_mag)  # Normalize to [0, 1]
+    prewitt_max = float(np.max(prewitt_mag))
+    if prewitt_max > 0.0:
+        prewitt_mag_norm = prewitt_mag / prewitt_max  # Normalize to [0, 1]
+    else:
+        prewitt_mag_norm = np.zeros_like(prewitt_mag)
 
     # S is the zero-mean image, H is the saliency map that combines intensity and gradient information
     S = img - np.mean(img)

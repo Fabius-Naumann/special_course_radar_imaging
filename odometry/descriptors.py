@@ -314,6 +314,7 @@ def computing_CFEAR_Features(img, preprocessing, k, z_percentile, max_distance_p
     # Step 2: Keypoint Extraction
     z_min_local = np.percentile(img_preprocessed, z_percentile)
     keypoints = k_strongest_keypoints(img_preprocessed, z_min=z_min_local, k=k, max_distance_percentile=max_distance_percentile)
+    keypoints = np.asarray(keypoints, dtype=float)
     if keypoints.size == 0:
         return np.empty((0, 4), dtype=float)
     
@@ -325,6 +326,11 @@ def computing_CFEAR_Features(img, preprocessing, k, z_percentile, max_distance_p
     keypoints_compensated = motion_compensation(
         keypoints_polar, velocity
     ) if motion_compensation_flag else keypoints_polar
+    keypoints_compensated = np.asarray(keypoints_compensated, dtype=float)
+    if keypoints_compensated.size == 0:
+        return np.empty((0, 4), dtype=float)
+    if keypoints_compensated.ndim == 1:
+        keypoints_compensated = keypoints_compensated.reshape(1, -1)
 
     # Step 4: Polar to Cartesian Conversion (point-wise for keypoints including intensity)
     keypoints_xy = polar_to_cartesian_points(
