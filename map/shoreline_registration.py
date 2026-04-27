@@ -662,12 +662,46 @@ def _coerce_frames(
     return shoreline_frames
 
 
+def _spatial_connectivity_labels(points: np.ndarray, max_gap_m: float) -> np.ndarray:
+    """Connected components from pairwise spatial proximity, without a density requirement."""
+    points = np.asarray(points, dtype=float)
+    if points.shape[0] == 0:
+        return np.empty((0,), dtype=int)
+
+    parent = np.arange(points.shape[0], dtype=int)
+
+    def find(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(index_a, index_b):
+        root_a = find(index_a)
+        root_b = find(index_b)
+        if root_a != root_b:
+            parent[root_b] = root_a
+
+    tree = cKDTree(points)
+    for index_a, index_b in tree.query_pairs(r=float(max_gap_m)):
+        union(index_a, index_b)
+
+    roots = np.array([find(index) for index in range(points.shape[0])], dtype=int)
+    labels = np.full(points.shape[0], -1, dtype=int)
+    next_label = 0
+    for root in sorted(set(roots.tolist())):
+        labels[roots == root] = next_label
+        next_label += 1
+    return labels
+
+
 def _cluster_anchor_points(
     points: np.ndarray,
     weights: np.ndarray,
     persistence: np.ndarray,
     *,
     cluster_eps_m: float,
+    cluster_method: str,
     min_segment_points: int,
     min_segment_length_m: float,
 ) -> WeightedPointSet:
@@ -681,7 +715,13 @@ def _cluster_anchor_points(
             quality_weights=np.empty((0,), dtype=float),
         )
 
-    labels = DBSCAN(eps=cluster_eps_m, min_samples=max(2, min_segment_points // 2)).fit_predict(points)
+    if cluster_method == "dbscan":
+        labels = DBSCAN(eps=cluster_eps_m, min_samples=max(2, min_segment_points // 2)).fit_predict(points)
+    elif cluster_method == "spatial_connectivity":
+        labels = _spatial_connectivity_labels(points, max_gap_m=cluster_eps_m)
+    else:
+        raise ValueError("cluster_method must be 'spatial_connectivity' or 'dbscan'")
+
     segment_ids = np.full(points.shape[0], -1, dtype=int)
     arc_lengths = np.zeros(points.shape[0], dtype=float)
     quality_weights = np.clip(weights, 0.0, 1.0)
@@ -751,6 +791,7 @@ def accumulate_shoreline_window(
     cell_size_m: float = 4.0,
     min_persistence: int = 2,
     cluster_eps_m: float = 12.0,
+    cluster_method: str = "spatial_connectivity",
     min_segment_points: int = 5,
     min_segment_length_m: float = 20.0,
 ) -> WeightedPointSet:
@@ -839,6 +880,7 @@ def accumulate_shoreline_window(
         aggregated.weights,
         aggregated.persistence,
         cluster_eps_m=cluster_eps_m,
+        cluster_method=cluster_method,
         min_segment_points=min_segment_points,
         min_segment_length_m=min_segment_length_m,
     )

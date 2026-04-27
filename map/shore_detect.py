@@ -18,6 +18,199 @@ from utils.data_loading import (  # noqa: E402
 )
 
 
+SHORELINE_CLUSTER_METHODS = {"azimuth_continuity", "dbscan"}
+
+
+def _remap_labels_contiguously(labels):
+    """Map nonnegative labels to 0..N while preserving -1 as noise."""
+    labels = np.asarray(labels, dtype=int)
+    remapped = np.full(labels.shape, -1, dtype=int)
+    next_label = 0
+    for label_value in sorted(set(labels.tolist())):
+        if label_value < 0:
+            continue
+        remapped[labels == label_value] = next_label
+        next_label += 1
+    return remapped
+
+
+def _merge_cluster_labels(labels, source_label, target_label):
+    if source_label == target_label or source_label < 0 or target_label < 0:
+        return labels
+    labels = labels.copy()
+    labels[labels == source_label] = target_label
+    return _remap_labels_contiguously(labels)
+
+
+def _azimuth_gap_bins(azimuth_a, azimuth_b, n_azimuth_bins):
+    raw_gap = abs(int(azimuth_b) - int(azimuth_a))
+    if n_azimuth_bins is None or int(n_azimuth_bins) <= 0:
+        return raw_gap
+    return min(raw_gap, int(n_azimuth_bins) - raw_gap)
+
+
+def _continuity_gap_allowed(
+    point_a,
+    point_b,
+    azimuth_a,
+    azimuth_b,
+    range_a_m,
+    range_b_m,
+    *,
+    n_azimuth_bins,
+    max_azimuth_gap_bins,
+    base_gap_m,
+    angular_gap_factor,
+    range_jump_factor,
+):
+    azimuth_gap_bins = _azimuth_gap_bins(azimuth_a, azimuth_b, n_azimuth_bins)
+    if azimuth_gap_bins > int(max_azimuth_gap_bins):
+        return False
+
+    if n_azimuth_bins is None or int(n_azimuth_bins) <= 0:
+        angle_resolution_rad = 0.0
+    else:
+        angle_resolution_rad = 2.0 * np.pi / float(n_azimuth_bins)
+
+    mean_range_m = 0.5 * (float(range_a_m) + float(range_b_m))
+    expected_angular_spacing_m = mean_range_m * float(azimuth_gap_bins) * angle_resolution_rad
+    range_jump_m = abs(float(range_b_m) - float(range_a_m))
+    allowed_gap_m = (
+        float(base_gap_m)
+        + float(angular_gap_factor) * expected_angular_spacing_m
+        + float(range_jump_factor) * range_jump_m
+    )
+    cartesian_gap_m = float(np.linalg.norm(np.asarray(point_b, dtype=float) - np.asarray(point_a, dtype=float)))
+    return cartesian_gap_m <= allowed_gap_m
+
+
+def cluster_shoreline_azimuth_continuity(
+    shoreline_points,
+    cart_points=None,
+    n_azimuth_bins=None,
+    range_resolution_m=0.155,
+    max_azimuth_gap_bins=4,
+    base_gap_m=8.0,
+    angular_gap_factor=2.5,
+    range_jump_factor=0.5,
+    connect_wrap=True,
+):
+    """Segment shoreline points by radar azimuth continuity with range-aware gap limits."""
+    if len(shoreline_points) == 0:
+        return np.array([], dtype=int)
+
+    shoreline_array = np.asarray(shoreline_points, dtype=float)
+    if shoreline_array.ndim != 2 or shoreline_array.shape[1] != 2:
+        raise ValueError("shoreline_points must contain (azimuth_idx, range_idx) pairs")
+
+    if cart_points is None:
+        cart_points = polar_to_cartesian_points(
+            shoreline_array[:, 1],
+            shoreline_array[:, 0],
+            range_resolution=float(range_resolution_m),
+            angle_resolution=(2.0 * np.pi / float(n_azimuth_bins))
+            if n_azimuth_bins is not None and int(n_azimuth_bins) > 0
+            else 2.0 * np.pi / 400.0,
+        )
+    else:
+        cart_points = np.asarray(cart_points, dtype=float)
+
+    labels = np.full(shoreline_array.shape[0], -1, dtype=int)
+    order = np.argsort(shoreline_array[:, 0], kind="stable")
+    current_label = 0
+    labels[order[0]] = current_label
+
+    ranges_m = shoreline_array[:, 1] * float(range_resolution_m)
+    for previous_idx, current_idx in zip(order[:-1], order[1:], strict=False):
+        connected = _continuity_gap_allowed(
+            cart_points[previous_idx],
+            cart_points[current_idx],
+            shoreline_array[previous_idx, 0],
+            shoreline_array[current_idx, 0],
+            ranges_m[previous_idx],
+            ranges_m[current_idx],
+            n_azimuth_bins=n_azimuth_bins,
+            max_azimuth_gap_bins=max_azimuth_gap_bins,
+            base_gap_m=base_gap_m,
+            angular_gap_factor=angular_gap_factor,
+            range_jump_factor=range_jump_factor,
+        )
+        if not connected:
+            current_label += 1
+        labels[current_idx] = current_label
+
+    if connect_wrap and order.size > 1 and n_azimuth_bins is not None:
+        first_idx = order[0]
+        last_idx = order[-1]
+        if _continuity_gap_allowed(
+            cart_points[last_idx],
+            cart_points[first_idx],
+            shoreline_array[last_idx, 0],
+            shoreline_array[first_idx, 0],
+            ranges_m[last_idx],
+            ranges_m[first_idx],
+            n_azimuth_bins=n_azimuth_bins,
+            max_azimuth_gap_bins=max_azimuth_gap_bins,
+            base_gap_m=base_gap_m,
+            angular_gap_factor=angular_gap_factor,
+            range_jump_factor=range_jump_factor,
+        ):
+            labels = _merge_cluster_labels(labels, labels[last_idx], labels[first_idx])
+
+    return _remap_labels_contiguously(labels)
+
+
+def cluster_shoreline_points(
+    shoreline_points,
+    cart_points=None,
+    n_azimuth_bins=None,
+    range_resolution_m=0.155,
+    method="azimuth_continuity",
+    dbscan_min_samples=5,
+    dbscan_cut_distance_m=10.0,
+    continuity_max_azimuth_gap_bins=4,
+    continuity_base_gap_m=8.0,
+    continuity_angular_gap_factor=2.5,
+    continuity_range_jump_factor=0.5,
+):
+    """Cluster shoreline points using the selected method."""
+    if method not in SHORELINE_CLUSTER_METHODS:
+        raise ValueError(f"method must be one of {sorted(SHORELINE_CLUSTER_METHODS)}")
+
+    if len(shoreline_points) == 0:
+        return np.array([], dtype=int)
+
+    if method == "dbscan":
+        if cart_points is None:
+            shoreline_array = np.asarray(shoreline_points, dtype=float)
+            cart_points = polar_to_cartesian_points(
+                shoreline_array[:, 1],
+                shoreline_array[:, 0],
+                range_resolution=float(range_resolution_m),
+                angle_resolution=(2.0 * np.pi / float(n_azimuth_bins))
+                if n_azimuth_bins is not None and int(n_azimuth_bins) > 0
+                else 2.0 * np.pi / 400.0,
+            )
+        cart_points = np.asarray(cart_points, dtype=float)
+        return cluster_shoreline_dbscan(
+            cart_points[:, 0],
+            cart_points[:, 1],
+            min_samples=dbscan_min_samples,
+            cut_distance=dbscan_cut_distance_m,
+        )
+
+    return cluster_shoreline_azimuth_continuity(
+        shoreline_points,
+        cart_points=cart_points,
+        n_azimuth_bins=n_azimuth_bins,
+        range_resolution_m=range_resolution_m,
+        max_azimuth_gap_bins=continuity_max_azimuth_gap_bins,
+        base_gap_m=continuity_base_gap_m,
+        angular_gap_factor=continuity_angular_gap_factor,
+        range_jump_factor=continuity_range_jump_factor,
+    )
+
+
 def _build_shoreline_metadata(
     shoreline_points,
     cart_points,
@@ -106,8 +299,14 @@ def extract_shoreline(
     cart_threshold=0.0,
     polar_threshold=0.5,
     clockwise_azimuth=False,
+    range_resolution_m=0.155,
+    cluster_method="azimuth_continuity",
     cluster_min_samples=5,
     cluster_cut_distance_m=10.0,
+    continuity_max_azimuth_gap_bins=4,
+    continuity_base_gap_m=8.0,
+    continuity_angular_gap_factor=2.5,
+    continuity_range_jump_factor=0.5,
     min_segment_points=5,
     min_segment_length_m=20.0,
     return_metadata=False,
@@ -207,13 +406,22 @@ def extract_shoreline(
         cart_points = polar_to_cartesian_points(
             np.asarray(range_indices, dtype=float),
             np.asarray(azimuth_indices, dtype=float),
+            range_resolution=float(range_resolution_m),
+            angle_resolution=(2.0 * np.pi) / float(n_azimuth),
             clockwise_azimuth=clockwise_azimuth,
         )
-        cluster_labels = cluster_shoreline_dbscan(
-            cart_points[:, 0],
-            cart_points[:, 1],
-            min_samples=cluster_min_samples,
-            cut_distance=cluster_cut_distance_m,
+        cluster_labels = cluster_shoreline_points(
+            shoreline_points,
+            cart_points=cart_points,
+            n_azimuth_bins=n_azimuth,
+            range_resolution_m=range_resolution_m,
+            method=cluster_method,
+            dbscan_min_samples=cluster_min_samples,
+            dbscan_cut_distance_m=cluster_cut_distance_m,
+            continuity_max_azimuth_gap_bins=continuity_max_azimuth_gap_bins,
+            continuity_base_gap_m=continuity_base_gap_m,
+            continuity_angular_gap_factor=continuity_angular_gap_factor,
+            continuity_range_jump_factor=continuity_range_jump_factor,
         )
     else:
         cart_points = np.empty((0, 2), dtype=float)
@@ -276,7 +484,13 @@ if __name__ == "__main__":
         cart_shoreline_y = pts[:, 1]
 
     print("Clustering shoreline points...")
-    cluster_labels = cluster_shoreline_dbscan(cart_shoreline_x, cart_shoreline_y)
+    cluster_labels = cluster_shoreline_points(
+        shoreline_points,
+        cart_points=np.column_stack((cart_shoreline_x, cart_shoreline_y))
+        if len(cart_shoreline_x) > 0
+        else np.empty((0, 2), dtype=float),
+        n_azimuth_bins=img.shape[0] if img.shape[1] > img.shape[0] else img.shape[1],
+    )
 
     from utils.visualisation import plot_shoreline_extraction
 

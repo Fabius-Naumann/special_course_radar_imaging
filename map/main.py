@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from map.shore_detect import cluster_shoreline_dbscan, extract_shoreline  # noqa: E402
+from map.shore_detect import SHORELINE_CLUSTER_METHODS, cluster_shoreline_points, extract_shoreline  # noqa: E402
 from map.shoreline_registration import (  # noqa: E402
     accumulate_shoreline_window,
     build_coastline_map,
@@ -39,7 +39,7 @@ from utils.visualisation import (  # noqa: E402
 GPS_TO_RADAR_OFFSET_M = -9
 GPS_TO_RADAR_LATERAL_OFFSET_M = 0.0
 HEADING_CORRECTION_DEG = 0.0
-RADAR_MAX_RANGE_M = 2000.0
+RADAR_MAX_RANGE_M = 1000.0
 AZIMUTH_CLOCKWISE = True
 
 
@@ -60,10 +60,58 @@ def parse_args():
     parser.add_argument("--morph-open-k", type=int, default=3, help="Morphological opening kernel size.")
     parser.add_argument("--morph-close-k", type=int, default=5, help="Morphological closing kernel size.")
     parser.add_argument(
+        "--shoreline-cluster-method",
+        choices=sorted(SHORELINE_CLUSTER_METHODS),
+        default="azimuth_continuity",
+        help="Method used to segment extracted shoreline points.",
+    )
+    parser.add_argument(
+        "--shoreline-cluster-max-azimuth-gap",
+        type=int,
+        default=4,
+        help="Maximum azimuth-bin gap allowed inside an azimuth-continuity segment.",
+    )
+    parser.add_argument(
+        "--shoreline-cluster-base-gap-m",
+        type=float,
+        default=8.0,
+        help="Base Cartesian gap allowed inside an azimuth-continuity segment.",
+    )
+    parser.add_argument(
+        "--shoreline-cluster-angular-gap-factor",
+        type=float,
+        default=2.5,
+        help="Multiplier for expected angular sampling distance in azimuth-continuity segmentation.",
+    )
+    parser.add_argument(
+        "--shoreline-cluster-range-jump-factor",
+        type=float,
+        default=0.5,
+        help="Multiplier for allowed radial jumps in azimuth-continuity segmentation.",
+    )
+    parser.add_argument(
+        "--shoreline-dbscan-min-samples",
+        type=int,
+        default=5,
+        help="DBSCAN min_samples when --shoreline-cluster-method=dbscan.",
+    )
+    parser.add_argument(
+        "--shoreline-dbscan-cut-distance-m",
+        type=float,
+        default=10.0,
+        help="DBSCAN eps distance in meters when --shoreline-cluster-method=dbscan.",
+    )
+    parser.add_argument(
         "--register-shoreline",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Run robust shoreline-to-map registration on a short frame window.",
+    )
+    parser.add_argument(
+        "--plot-osm-overlay",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Plot raw shoreline detections on a static OpenStreetMap basemap.",
     )
     parser.add_argument("--window-size", type=int, default=5, help="Number of frames in the temporal shoreline window.")
     parser.add_argument(
@@ -204,6 +252,13 @@ def main():
         "min_cluster_area": args.min_cluster_area,
         "morph_open_k": args.morph_open_k,
         "morph_close_k": args.morph_close_k,
+        "shoreline_cluster_method": args.shoreline_cluster_method,
+        "shoreline_cluster_max_azimuth_gap": args.shoreline_cluster_max_azimuth_gap,
+        "shoreline_cluster_base_gap_m": args.shoreline_cluster_base_gap_m,
+        "shoreline_cluster_angular_gap_factor": args.shoreline_cluster_angular_gap_factor,
+        "shoreline_cluster_range_jump_factor": args.shoreline_cluster_range_jump_factor,
+        "shoreline_dbscan_min_samples": args.shoreline_dbscan_min_samples,
+        "shoreline_dbscan_cut_distance_m": args.shoreline_dbscan_cut_distance_m,
         "heading_correction_deg": HEADING_CORRECTION_DEG,
         "gps_lateral_offset_m": GPS_TO_RADAR_LATERAL_OFFSET_M,
         "gps_to_radar_forward_offset_m": GPS_TO_RADAR_OFFSET_M,
@@ -212,6 +267,7 @@ def main():
         "total_available_images": total_available,
         "selected_indices": selected_indices,
         "register_shoreline": args.register_shoreline,
+        "plot_osm_overlay": args.plot_osm_overlay,
         "window_size": args.window_size,
         "window_min_persistence": args.window_min_persistence,
         "aggregation_cell_size_m": args.aggregation_cell_size_m,
@@ -233,7 +289,7 @@ def main():
     print(f"Run directory: {run_root}")
     print(f"Selected {len(selected_indices)} image(s) out of {total_available} available.")
 
-    gps_data = load_gps_data()
+    gps_data = load_gps_data() if args.plot_osm_overlay or args.register_shoreline else None
     coastline_map_cache = {}
 
     summary_rows = []
@@ -243,6 +299,10 @@ def main():
         if args.correct_black_lines:
             img = correct_black_lines(img)
 
+        n_range_bins = img.shape[1] if img.shape[1] > img.shape[0] else img.shape[0]
+        n_azimuth_bins = img.shape[0] if img.shape[1] > img.shape[0] else img.shape[1]
+        range_resolution_m = RADAR_MAX_RANGE_M / float(max(n_range_bins - 1, 1))
+
         shoreline_result = extract_shoreline(
             img,
             min_cluster_area_m2=args.min_cluster_area,
@@ -250,6 +310,14 @@ def main():
             morph_close_k=args.morph_close_k,
             grid_size=args.grid_size,
             clockwise_azimuth=AZIMUTH_CLOCKWISE,
+            range_resolution_m=range_resolution_m,
+            cluster_method=args.shoreline_cluster_method,
+            cluster_min_samples=args.shoreline_dbscan_min_samples,
+            cluster_cut_distance_m=args.shoreline_dbscan_cut_distance_m,
+            continuity_max_azimuth_gap_bins=args.shoreline_cluster_max_azimuth_gap,
+            continuity_base_gap_m=args.shoreline_cluster_base_gap_m,
+            continuity_angular_gap_factor=args.shoreline_cluster_angular_gap_factor,
+            continuity_range_jump_factor=args.shoreline_cluster_range_jump_factor,
             min_segment_points=args.shoreline_min_segment_points,
             min_segment_length_m=args.shoreline_min_segment_length_m,
             return_metadata=args.register_shoreline,
@@ -263,9 +331,6 @@ def main():
         if shoreline_points:
             azimuth_indices, range_indices = zip(*shoreline_points, strict=False)
 
-            n_range_bins = img.shape[1] if img.shape[1] > img.shape[0] else img.shape[0]
-            n_azimuth_bins = img.shape[0] if img.shape[1] > img.shape[0] else img.shape[1]
-
             cart_points = polar_indices_to_cartesian(
                 np.array(range_indices),
                 np.array(azimuth_indices),
@@ -274,7 +339,19 @@ def main():
                 max_range_m=RADAR_MAX_RANGE_M,
                 clockwise_azimuth=AZIMUTH_CLOCKWISE,
             )
-            cluster_labels = cluster_shoreline_dbscan(cart_points[:, 0], cart_points[:, 1])
+            cluster_labels = cluster_shoreline_points(
+                shoreline_points,
+                cart_points=cart_points,
+                n_azimuth_bins=n_azimuth_bins,
+                range_resolution_m=range_resolution_m,
+                method=args.shoreline_cluster_method,
+                dbscan_min_samples=args.shoreline_dbscan_min_samples,
+                dbscan_cut_distance_m=args.shoreline_dbscan_cut_distance_m,
+                continuity_max_azimuth_gap_bins=args.shoreline_cluster_max_azimuth_gap,
+                continuity_base_gap_m=args.shoreline_cluster_base_gap_m,
+                continuity_angular_gap_factor=args.shoreline_cluster_angular_gap_factor,
+                continuity_range_jump_factor=args.shoreline_cluster_range_jump_factor,
+            )
         else:
             cart_points = np.empty((0, 2), dtype=float)
             cluster_labels = np.array([])
@@ -304,7 +381,7 @@ def main():
         radar_lat = None
         radar_lon = None
         map_plot_relpath = ""
-        try:
+        if gps_data is not None:
             image_timestamp = extract_timestamp(image_path.name)
             pose = interpolate_gps_pose(gps_data, image_timestamp)
 
@@ -318,6 +395,8 @@ def main():
                     lateral_m=GPS_TO_RADAR_LATERAL_OFFSET_M,
                 )
 
+        if args.plot_osm_overlay and pose is not None:
+            try:
                 map_output_path = image_dir / map_plot_name
                 plot_radar_overlay_on_osm_static(
                     center_lat=radar_lat,
@@ -333,8 +412,8 @@ def main():
                     ),
                 )
                 map_plot_relpath = f"images/{map_plot_name}"
-        except Exception as error:
-            print(f"Skipping OSM map for {image_path.name}: {error}")
+            except Exception as error:
+                print(f"Skipping OSM overlay for {image_path.name}: {error}")
 
         registration_plot_relpath = ""
         registration_success = False
@@ -357,6 +436,11 @@ def main():
                     if args.correct_black_lines:
                         window_img = correct_black_lines(window_img)
 
+                    window_n_range_bins = (
+                        window_img.shape[1] if window_img.shape[1] > window_img.shape[0] else window_img.shape[0]
+                    )
+                    window_range_resolution_m = RADAR_MAX_RANGE_M / float(max(window_n_range_bins - 1, 1))
+
                     _, _, _, _, window_metadata = extract_shoreline(
                         window_img,
                         min_cluster_area_m2=args.min_cluster_area,
@@ -364,6 +448,14 @@ def main():
                         morph_close_k=args.morph_close_k,
                         grid_size=args.grid_size,
                         clockwise_azimuth=AZIMUTH_CLOCKWISE,
+                        range_resolution_m=window_range_resolution_m,
+                        cluster_method=args.shoreline_cluster_method,
+                        cluster_min_samples=args.shoreline_dbscan_min_samples,
+                        cluster_cut_distance_m=args.shoreline_dbscan_cut_distance_m,
+                        continuity_max_azimuth_gap_bins=args.shoreline_cluster_max_azimuth_gap,
+                        continuity_base_gap_m=args.shoreline_cluster_base_gap_m,
+                        continuity_angular_gap_factor=args.shoreline_cluster_angular_gap_factor,
+                        continuity_range_jump_factor=args.shoreline_cluster_range_jump_factor,
                         min_segment_points=args.shoreline_min_segment_points,
                         min_segment_length_m=args.shoreline_min_segment_length_m,
                         return_metadata=True,
@@ -413,6 +505,9 @@ def main():
                         anchor_index=anchor_index,
                         cell_size_m=args.aggregation_cell_size_m,
                         min_persistence=args.window_min_persistence,
+                        cluster_method="dbscan"
+                        if args.shoreline_cluster_method == "dbscan"
+                        else "spatial_connectivity",
                         min_segment_points=args.shoreline_min_segment_points,
                         min_segment_length_m=args.shoreline_min_segment_length_m,
                     )
