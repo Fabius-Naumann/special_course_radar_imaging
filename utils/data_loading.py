@@ -18,7 +18,7 @@ else:
 # Folder and file paths to the radar images and GPS data
 FOLDER_PATH = DATA_DIR / "_radar_data_b_scan_image"
 CSV_FILE_PATH = DATA_DIR / "snowborbus_gps_data.csv"
-IMU_FILE_PATH = DATA_DIR / "_ouster_imu" / "imu_data_copy.csv"
+IMU_FILE_PATH = DATA_DIR / "imu.csv"
 
 
 # Transformation functions for radar data
@@ -433,7 +433,11 @@ def polar_indices_to_cartesian(
 
 
 # Load functions for radar images and GPS data
-def load_radar_images(num_images=5, folder_path=FOLDER_PATH, correct_black_lines_flag=True):
+def load_radar_images(num_images=5, folder_path=FOLDER_PATH, correct_black_lines_flag=True, dataset = None):
+    if dataset != None:
+        folder_path = DATA_DIR / f"_radar_data_b_scan_image_{dataset}"
+        print(f"Loading images from {folder_path}")
+    
     # List all PNG files in the folder and sort them by timestamp
     image_files = sorted([f.name for f in Path(folder_path).iterdir() if f.suffix == ".png"], key=extract_timestamp)
 
@@ -457,7 +461,10 @@ def load_gps_data(csv_file_path=CSV_FILE_PATH):
 
 def load_imu_data(csv_file_path=IMU_FILE_PATH):
     imu_data = pd.read_csv(csv_file_path)
-    imu_data["timestamp"] = pd.to_datetime(imu_data["timestamp"])
+    imu_data["timestamp"] = pd.to_datetime(
+        imu_data["timestamp_cet"],
+        format="%Y-%m-%d_%H-%M-%S_%f",
+    )
     return imu_data
 
 # Add function which corrects the blank space in radar images
@@ -466,14 +473,16 @@ def correct_black_lines(image, min_black_line_width=50):
     Corrects fragmented data with black horizontal lines (consecutive missing data) in the middle of images.
     If any data to the right of the black line is present, it shifts the data to the left, essentially moving the black line to the right.
     """
-    # Convert the image to grayscale if it's not already
-    if len(image.shape) == 3 and image.shape[2] == 3:
-        gray_image = np.mean(image, axis=2).astype(np.uint8)
+    # Keep float precision to avoid collapsing [0,1] PNG data to zeros.
+    image_arr = np.asarray(image)
+    if image_arr.ndim == 3 and image_arr.shape[2] >= 3:
+        gray_image = image_arr[..., :3].mean(axis=2).astype(np.float32, copy=False)
     else:
-        gray_image = image.copy()
+        gray_image = image_arr.astype(np.float32, copy=True)
 
-    # Identify black lines
-    black_spots_mask = gray_image == 0
+    # Identify black lines with a dtype-aware near-zero threshold.
+    zero_eps = 1e-8 if np.issubdtype(gray_image.dtype, np.floating) else 0
+    black_spots_mask = gray_image <= zero_eps
 
     # find connected black line segments and their widths
     for row in range(black_spots_mask.shape[0]):

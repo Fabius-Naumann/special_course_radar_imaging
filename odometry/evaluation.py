@@ -203,10 +203,35 @@ def create_stabilized_overlay_video(
         raise ValueError("'images' must contain at least one frame.")
 
     n_frames = len(images)
-    if len(rotations_deg) != n_frames - 1 or len(translations) != n_frames - 1:
-        raise ValueError(
-            "'rotations_deg' and 'translations' must both have length len(images)-1."
-        )
+    # Accept either incremental transforms (len = n_frames-1) or absolute poses (len = n_frames).
+    # If absolute poses are provided, convert to incremental steps internally.
+    rot_arr = np.asarray(rotations_deg, dtype=float).reshape(-1)
+    trans_arr = np.asarray(translations, dtype=float)
+    if trans_arr.ndim == 1:
+        trans_arr = trans_arr.reshape(-1, 2)
+
+    def shortest_signed_angle_diff_deg(a):
+        d = np.diff(a)
+        d = (d + 180.0) % 360.0 - 180.0
+        return d
+
+    if len(rot_arr) == n_frames:
+        rotations_inc_deg = shortest_signed_angle_diff_deg(rot_arr)
+    elif len(rot_arr) == n_frames - 1:
+        rotations_inc_deg = rot_arr
+    elif len(rot_arr) == 0:
+        rotations_inc_deg = np.empty((0,), dtype=float)
+    else:
+        raise ValueError("'rotations_deg' must have length N or N-1 where N=len(images)")
+
+    if trans_arr.shape[0] == n_frames:
+        translations_inc_xy = np.diff(trans_arr, axis=0)
+    elif trans_arr.shape[0] == n_frames - 1:
+        translations_inc_xy = trans_arr
+    elif trans_arr.shape[0] == 0:
+        translations_inc_xy = np.empty((0, 2), dtype=float)
+    else:
+        raise ValueError("'translations' must have shape (N,2) or (N-1,2) where N=len(images)")
     
     if int(frames_per_image) < 1:
         raise ValueError("'frames_per_image' must be >= 1.")
@@ -279,9 +304,9 @@ def create_stabilized_overlay_video(
             # Odometry is in math coordinates (x right, y up, CCW positive).
             # Images are in pixel coordinates (x right, y down), so convert via:
             # theta_img = -theta_math, t_img = [tx, -ty].
-            theta = np.radians(-float(rotations_deg[i - 1]))
+            theta = np.radians(-float(rotations_inc_deg[i - 1]))
             c, s = np.cos(theta), np.sin(theta)
-            tx_m, ty_m = np.asarray(translations[i - 1], dtype=float)[:2]
+            tx_m, ty_m = np.asarray(translations_inc_xy[i - 1], dtype=float)[:2]
             tx_px = tx_m * pixels_per_meter
             ty_px = -ty_m * pixels_per_meter
 
@@ -522,6 +547,47 @@ def interpolate_gps_motion(gps_subset, timestamps):
     
     return pd.DataFrame(interpolated_positions)
 
+def imu_to_xytheta(imu_data):
+    """
+    imu_data: pandas DataFrame with columns angular_velocity_x	angular_velocity_y	angular_velocity_z	linear_acceleration_x	linear_acceleration_y	linear_acceleration_z
+
+    Returns:
+        dx:   N array
+        dy:   N array
+        dtheta: N array
+    """
+    # Time differences between timestamps, expressed in seconds.
+    timestamps = pd.to_datetime(imu_data['timestamp'], errors='coerce').to_numpy(dtype='datetime64[ns]')
+    dt = np.diff(timestamps).astype('timedelta64[ns]').astype(np.float64) / 1e9
+    dt = np.append(dt, dt[-1])  # Assume constant dt for the last element
+
+    # Extract body-frame acceleration and yaw rate
+    ax = imu_data['linear_acceleration_x'].values
+    ay = imu_data['linear_acceleration_y'].values
+    wz = imu_data['angular_velocity_z'].values   # yaw rate
+
+    # Integrate yaw rate to get heading increments
+    dtheta = wz * dt
+
+    # Rotate body-frame acceleration into world frame using incremental heading
+    theta = np.cumsum(dtheta)  # heading over time
+
+    # World-frame acceleration
+    ax_w = ax * np.cos(theta) - ay * np.sin(theta)
+    ay_w = ax * np.sin(theta) + ay * np.cos(theta)
+
+    # Integrate acceleration → velocity
+    vx = np.cumsum(ax_w * dt)
+    vy = np.cumsum(ay_w * dt)
+
+    # Integrate velocity → position increments
+    dx = vx * dt
+    dy = vy * dt
+
+    dtheta = np.degrees(dtheta)  # Convert to degrees for consistency with GPS bearing
+
+    return dx, dy, dtheta
+
 def calculate_odo_longitude_latitude(start_lat, start_lon, translation_m, rotation_rad):
     """
     Calculate new GPS coordinates given a starting point, translation, and rotation.
@@ -551,6 +617,49 @@ def calculate_odo_longitude_latitude(start_lat, start_lon, translation_m, rotati
     
     return new_lat, new_lon
 
+def rigid_body_transform(
+    lat,
+    lon,
+    heading_deg,
+    offset_distance_m=9.0,
+    offset_angle_deg=0.0,
+):
+    """
+    Apply a 2D rigid-body lever-arm correction to geodetic coordinates.
+
+    Parameters:
+    - lat: Latitude in degrees (sensor source origin)
+    - lon: Longitude in degrees (sensor source origin)
+    - heading_deg: Compass heading in degrees (0=North, clockwise positive)
+    - offset_distance_m: Lever-arm magnitude in meters (default 9 m)
+    - offset_angle_deg: Lever-arm angle in body frame in degrees.
+        0 deg means "forward" from the source sensor toward the target sensor.
+
+    Returns:
+    - corrected_lat: Latitude in degrees at target sensor origin
+    - corrected_lon: Longitude in degrees at target sensor origin
+    """
+    lat = float(lat)
+    lon = float(lon)
+    heading_rad = np.radians(float(heading_deg))
+    alpha_rad = np.radians(float(offset_angle_deg))
+
+    # Body-frame offset from source->target sensor.
+    # x_body: forward, y_body: starboard.
+    x_body = float(offset_distance_m) * np.cos(alpha_rad)
+    y_body = float(offset_distance_m) * np.sin(alpha_rad)
+
+    # Rotate body-frame offset into local ENU world frame.
+    east_m = x_body * np.sin(heading_rad) + y_body * np.cos(heading_rad)
+    north_m = x_body * np.cos(heading_rad) - y_body * np.sin(heading_rad)
+
+    lat_offset = north_m / 111320.0
+    lon_offset = east_m / (111320.0 * np.cos(np.radians(lat)) + 1e-12)
+
+    corrected_lat = lat + lat_offset
+    corrected_lon = lon + lon_offset
+    return corrected_lat, corrected_lon
+
 def map_gps(
     gps_data,
     odo_trans,
@@ -560,6 +669,9 @@ def map_gps(
     odo_rotations_reference="relative",
     odo_longitudes=None,
     odo_latitudes=None,
+    apply_rigid_body_correction=True,
+    sensor_offset_m=9.0,
+    sensor_offset_angle_deg=0.0,
     output_file="odometry\\gps_map.html",
 ):
     """
@@ -577,6 +689,10 @@ def map_gps(
             Use "relative" when odometry yaw starts at 0 in frame-1.
     - odo_longitudes: Optional odometry longitudes (direct trajectory input)
     - odo_latitudes: Optional odometry latitudes (direct trajectory input)
+        - apply_rigid_body_correction: If True, convert odometry points from radar origin
+            to GPS antenna origin for a fair overlay with raw GPS measurements.
+        - sensor_offset_m: Lever-arm distance from GPS->radar in meters (default 9 m)
+        - sensor_offset_angle_deg: GPS->radar angle in body frame (0=forward)
     - output_file: HTML file path for the generated interactive map
     """
     if timestamps is None or len(timestamps) == 0:
@@ -686,6 +802,7 @@ def map_gps(
                 step_headings = np.full((n_steps,), initial_heading_rad, dtype=float)
 
             current_lat, current_lon = coordinates[0]
+
             coordinates_odo = [[current_lat, current_lon]]
             headings_odo = [float(step_headings[0]) if n_steps > 0 else initial_heading_rad]
 
@@ -701,6 +818,22 @@ def map_gps(
                 )
                 coordinates_odo.append([current_lat, current_lon])
                 headings_odo.append(current_heading_rad)
+
+    # Apply rigid-body correction to convert from radar origin to GPS origin.
+    # User-provided lever-arm is GPS->radar, so invert by 180 deg.
+    if apply_rigid_body_correction:
+        corrected_coordinates_odo = []
+        correction_angle_deg = (float(sensor_offset_angle_deg) + 180.0) % 360.0
+        for (lat, lon), heading in zip(coordinates_odo, headings_odo):
+            corrected_lat, corrected_lon = rigid_body_transform(
+                lat,
+                lon,
+                np.degrees(heading),
+                offset_distance_m=sensor_offset_m,
+                offset_angle_deg=correction_angle_deg,
+            )
+            corrected_coordinates_odo.append([corrected_lat, corrected_lon])
+        coordinates_odo = corrected_coordinates_odo
 
     center_lat = float(gps_plot['latitude'].mean())
     center_lon = float(gps_plot['longitude'].mean())
