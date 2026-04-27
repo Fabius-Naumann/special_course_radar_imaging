@@ -31,7 +31,8 @@ from utils.data_loading import (  # noqa: E402
     polar_indices_to_cartesian,
 )
 from utils.visualisation import (  # noqa: E402
-    plot_radar_overlay_on_osm_static,
+    plot_registered_shoreline_overlay,
+    plot_registration_confidence_over_time,
     plot_shoreline_extraction,
     plot_shoreline_registration_result,
 )
@@ -111,9 +112,26 @@ def parse_args():
         "--plot-osm-overlay",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Plot raw shoreline detections on a static OpenStreetMap basemap.",
+        help="Plot registration detections on the vector OSM coastline map. Requires --register-shoreline.",
     )
-    parser.add_argument("--window-size", type=int, default=5, help="Number of frames in the temporal shoreline window.")
+    parser.add_argument(
+        "--osm-overlay-cell-scale",
+        type=float,
+        default=5.0,
+        help="Grid-space thickening factor for the OSM radar overlay. Larger values make detections appear larger.",
+    )
+    parser.add_argument(
+        "--window-size",
+        type=int,
+        default=3,
+        help="Number of frames in the temporal shoreline window, including the current frame.",
+    )
+    parser.add_argument(
+        "--use-future-window",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use a symmetric past/future frame window. Disabled by default for causal live-style processing.",
+    )
     parser.add_argument(
         "--window-min-persistence",
         type=int,
@@ -141,7 +159,7 @@ def parse_args():
     parser.add_argument(
         "--registration-radius-m",
         type=float,
-        default=1500.0,
+        default=1200.0,
         help="Radius around the prior position used when building the local coastline map.",
     )
     parser.add_argument(
@@ -153,7 +171,7 @@ def parse_args():
     parser.add_argument(
         "--translation-search-m",
         type=float,
-        default=150.0,
+        default=120.0,
         help="Translation search radius around the prior during coarse registration.",
     )
     parser.add_argument(
@@ -211,10 +229,19 @@ def _select_indices(total_images: int, start_image: int, max_images: int, step: 
     return selected[: max(max_images, 0)]
 
 
-def _window_indices(anchor_index: int, total_images: int, window_size: int) -> list[int]:
-    half_window = max(int(window_size) // 2, 0)
-    start = max(0, int(anchor_index) - half_window)
-    end = min(total_images, int(anchor_index) + half_window + 1)
+def _window_indices(
+    anchor_index: int, total_images: int, window_size: int, *, include_future: bool = False
+) -> list[int]:
+    window_size = max(int(window_size), 1)
+    anchor_index = int(anchor_index)
+    if include_future:
+        past_count = window_size // 2
+        future_count = window_size - past_count - 1
+        start = max(0, anchor_index - past_count)
+        end = min(total_images, anchor_index + future_count + 1)
+    else:
+        start = max(0, anchor_index - window_size + 1)
+        end = min(total_images, anchor_index + 1)
     return list(range(start, end))
 
 
@@ -268,7 +295,9 @@ def main():
         "selected_indices": selected_indices,
         "register_shoreline": args.register_shoreline,
         "plot_osm_overlay": args.plot_osm_overlay,
+        "osm_overlay_cell_scale": args.osm_overlay_cell_scale,
         "window_size": args.window_size,
+        "use_future_window": args.use_future_window,
         "window_min_persistence": args.window_min_persistence,
         "aggregation_cell_size_m": args.aggregation_cell_size_m,
         "shoreline_min_segment_points": args.shoreline_min_segment_points,
@@ -289,12 +318,16 @@ def main():
     print(f"Run directory: {run_root}")
     print(f"Selected {len(selected_indices)} image(s) out of {total_available} available.")
 
-    gps_data = load_gps_data() if args.plot_osm_overlay or args.register_shoreline else None
+    if args.plot_osm_overlay and not args.register_shoreline:
+        print("OSM overlay requires --register-shoreline; no fallback overlay will be generated.")
+
+    gps_data = load_gps_data() if args.register_shoreline else None
     coastline_map_cache = {}
 
     summary_rows = []
     for image_index in selected_indices:
         image_path = image_files[image_index]
+        image_timestamp = extract_timestamp(image_path.name)
         img = plt.imread(image_path)
         if args.correct_black_lines:
             img = correct_black_lines(img)
@@ -377,43 +410,9 @@ def main():
             writer.writerows(shoreline_points)
 
         pose = None
-        corrected_heading_deg = None
-        radar_lat = None
-        radar_lon = None
         map_plot_relpath = ""
         if gps_data is not None:
-            image_timestamp = extract_timestamp(image_path.name)
             pose = interpolate_gps_pose(gps_data, image_timestamp)
-
-            if pose is not None:
-                corrected_heading_deg = (pose["bearing"] + HEADING_CORRECTION_DEG) % 360.0
-                radar_lat, radar_lon = offset_latlon_by_local_offsets(
-                    pose["latitude"],
-                    pose["longitude"],
-                    heading_deg=corrected_heading_deg,
-                    forward_m=GPS_TO_RADAR_OFFSET_M,
-                    lateral_m=GPS_TO_RADAR_LATERAL_OFFSET_M,
-                )
-
-        if args.plot_osm_overlay and pose is not None:
-            try:
-                map_output_path = image_dir / map_plot_name
-                plot_radar_overlay_on_osm_static(
-                    center_lat=radar_lat,
-                    center_lon=radar_lon,
-                    heading_deg=corrected_heading_deg,
-                    output_path=map_output_path,
-                    shoreline_xy=cart_points,
-                    cart_mask=cart_mask_float,
-                    max_range_m=RADAR_MAX_RANGE_M,
-                    title=(
-                        f"{image_path.name} | heading={corrected_heading_deg:.1f}° "
-                        f"(corr={HEADING_CORRECTION_DEG:+.1f}°)"
-                    ),
-                )
-                map_plot_relpath = f"images/{map_plot_name}"
-            except Exception as error:
-                print(f"Skipping OSM overlay for {image_path.name}: {error}")
 
         registration_plot_relpath = ""
         registration_success = False
@@ -430,7 +429,12 @@ def main():
         if args.register_shoreline and pose is not None and shoreline_metadata is not None:
             try:
                 window_frames = []
-                for window_idx in _window_indices(image_index, total_available, args.window_size):
+                for window_idx in _window_indices(
+                    image_index,
+                    total_available,
+                    args.window_size,
+                    include_future=args.use_future_window,
+                ):
                     window_path = image_files[window_idx]
                     window_img = plt.imread(window_path)
                     if args.correct_black_lines:
@@ -500,11 +504,15 @@ def main():
                         key=lambda idx: abs(int(window_frames[idx]["frame_id"]) - int(image_index)),
                     )
                     anchor_frame = window_frames[anchor_index]
+                    effective_min_persistence = min(
+                        max(int(args.window_min_persistence), 1),
+                        max(len(window_frames), 1),
+                    )
                     point_set = accumulate_shoreline_window(
                         window_frames,
                         anchor_index=anchor_index,
                         cell_size_m=args.aggregation_cell_size_m,
-                        min_persistence=args.window_min_persistence,
+                        min_persistence=effective_min_persistence,
                         cluster_method="dbscan"
                         if args.shoreline_cluster_method == "dbscan"
                         else "spatial_connectivity",
@@ -579,6 +587,24 @@ def main():
                             ),
                         )
                         registration_plot_relpath = f"images/{registration_plot_name}"
+
+                        if args.plot_osm_overlay:
+                            try:
+                                plot_registered_shoreline_overlay(
+                                    coastline_map=coastline_map,
+                                    registration_result=registration_result,
+                                    output_path=image_dir / map_plot_name,
+                                    radar_overlay=cart_mask_float,
+                                    radar_extent_m=RADAR_MAX_RANGE_M,
+                                    overlay_cell_scale=args.osm_overlay_cell_scale,
+                                    title=(
+                                        f"{image_path.name} | registered CFAR response on OSM coastline "
+                                        f"| conf={registration_result.confidence:.2f}"
+                                    ),
+                                )
+                                map_plot_relpath = f"images/{map_plot_name}"
+                            except Exception as error:
+                                print(f"Skipping registered OSM overlay for {image_path.name}: {error}")
                     else:
                         registration_reason = "no_persistent_points"
                 else:
@@ -591,6 +617,7 @@ def main():
             {
                 "image_index": image_index,
                 "image_filename": image_path.name,
+                "timestamp": image_timestamp,
                 "shoreline_points": len(shoreline_points),
                 "image_plot": f"images/{image_plot_name}",
                 "points_csv": f"shoreline_points/{points_name}",
@@ -618,6 +645,7 @@ def main():
         fieldnames = [
             "image_index",
             "image_filename",
+            "timestamp",
             "shoreline_points",
             "image_plot",
             "points_csv",
@@ -637,6 +665,13 @@ def main():
         writer = csv.DictWriter(summary_csv_file, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(summary_rows)
+
+    confidence_plot_path = image_dir / "registration_confidence_over_time.png"
+    plot_registration_confidence_over_time(
+        summary_rows,
+        confidence_plot_path,
+        title="ICP Registration Confidence Over Time",
+    )
 
     print(f"Completed. Wrote {len(summary_rows)} result row(s).")
     print(f"Artifacts saved in: {run_root}")
