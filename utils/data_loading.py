@@ -436,6 +436,8 @@ def polar_indices_to_cartesian(
 def load_radar_images(num_images=5, folder_path=FOLDER_PATH, correct_black_lines_flag=True, dataset = None):
     if dataset != None:
         folder_path = DATA_DIR / f"_radar_data_b_scan_image_{dataset}"
+        if dataset == 1:
+            folder_path = DATA_DIR / "_radar_data_b_scan_image"
         print(f"Loading images from {folder_path}")
     
     # List all PNG files in the folder and sort them by timestamp
