@@ -203,35 +203,10 @@ def create_stabilized_overlay_video(
         raise ValueError("'images' must contain at least one frame.")
 
     n_frames = len(images)
-    # Accept either incremental transforms (len = n_frames-1) or absolute poses (len = n_frames).
-    # If absolute poses are provided, convert to incremental steps internally.
-    rot_arr = np.asarray(rotations_deg, dtype=float).reshape(-1)
-    trans_arr = np.asarray(translations, dtype=float)
-    if trans_arr.ndim == 1:
-        trans_arr = trans_arr.reshape(-1, 2)
-
-    def shortest_signed_angle_diff_deg(a):
-        d = np.diff(a)
-        d = (d + 180.0) % 360.0 - 180.0
-        return d
-
-    if len(rot_arr) == n_frames:
-        rotations_inc_deg = shortest_signed_angle_diff_deg(rot_arr)
-    elif len(rot_arr) == n_frames - 1:
-        rotations_inc_deg = rot_arr
-    elif len(rot_arr) == 0:
-        rotations_inc_deg = np.empty((0,), dtype=float)
-    else:
-        raise ValueError("'rotations_deg' must have length N or N-1 where N=len(images)")
-
-    if trans_arr.shape[0] == n_frames:
-        translations_inc_xy = np.diff(trans_arr, axis=0)
-    elif trans_arr.shape[0] == n_frames - 1:
-        translations_inc_xy = trans_arr
-    elif trans_arr.shape[0] == 0:
-        translations_inc_xy = np.empty((0, 2), dtype=float)
-    else:
-        raise ValueError("'translations' must have shape (N,2) or (N-1,2) where N=len(images)")
+    if len(rotations_deg) != n_frames - 1 or len(translations) != n_frames - 1:
+        raise ValueError(
+            "'rotations_deg' and 'translations' must both have length len(images)-1."
+        )
     
     if int(frames_per_image) < 1:
         raise ValueError("'frames_per_image' must be >= 1.")
@@ -304,9 +279,9 @@ def create_stabilized_overlay_video(
             # Odometry is in math coordinates (x right, y up, CCW positive).
             # Images are in pixel coordinates (x right, y down), so convert via:
             # theta_img = -theta_math, t_img = [tx, -ty].
-            theta = np.radians(-float(rotations_inc_deg[i - 1]))
+            theta = np.radians(-float(rotations_deg[i - 1]))
             c, s = np.cos(theta), np.sin(theta)
-            tx_m, ty_m = np.asarray(translations_inc_xy[i - 1], dtype=float)[:2]
+            tx_m, ty_m = np.asarray(translations[i - 1], dtype=float)[:2]
             tx_px = tx_m * pixels_per_meter
             ty_px = -ty_m * pixels_per_meter
 
@@ -462,6 +437,11 @@ def interpolate_gps_motion(gps_subset, timestamps):
     """
     interpolated_positions = []
     gps_sorted = gps_subset.sort_values('time-string').reset_index(drop=True)
+    gps_with_bearing = gps_sorted
+    if 'bearing' in gps_sorted.columns:
+        valid_bearing_rows = gps_sorted[gps_sorted['bearing'].notna()].reset_index(drop=True)
+        if not valid_bearing_rows.empty:
+            gps_with_bearing = valid_bearing_rows
 
     def interpolate_bearing(before_bearing, after_bearing, ratio):
         """Interpolate compass angles (degrees) along the shortest arc."""
@@ -479,8 +459,8 @@ def interpolate_gps_motion(gps_subset, timestamps):
     
     for t in timestamps:
         radar_time_point = pd.to_datetime(t)
-        before_candidates = gps_sorted[gps_sorted['time-string'] <= radar_time_point]
-        after_candidates = gps_sorted[gps_sorted['time-string'] >= radar_time_point]
+        before_candidates = gps_with_bearing[gps_with_bearing['time-string'] <= radar_time_point]
+        after_candidates = gps_with_bearing[gps_with_bearing['time-string'] >= radar_time_point]
 
         # Clamp to nearest available GPS point if timestamp is outside GPS range
         if before_candidates.empty:
@@ -489,7 +469,7 @@ def interpolate_gps_motion(gps_subset, timestamps):
                 'time-string': radar_time_point,
                 'latitude': nearest['latitude'],
                 'longitude': nearest['longitude'],
-                'bearing': nearest['bearing'] if 'bearing' in gps_sorted.columns else np.nan
+                'bearing': nearest['bearing'] if 'bearing' in gps_with_bearing.columns else np.nan
             })
             continue
 
@@ -499,7 +479,7 @@ def interpolate_gps_motion(gps_subset, timestamps):
                 'time-string': radar_time_point,
                 'latitude': nearest['latitude'],
                 'longitude': nearest['longitude'],
-                'bearing': nearest['bearing'] if 'bearing' in gps_sorted.columns else np.nan
+                'bearing': nearest['bearing'] if 'bearing' in gps_with_bearing.columns else np.nan
             })
             continue
 
@@ -513,7 +493,7 @@ def interpolate_gps_motion(gps_subset, timestamps):
                 'time-string': radar_time_point,
                 'latitude': before['latitude'],
                 'longitude': before['longitude'],
-                'bearing': before['bearing'] if 'bearing' in gps_sorted.columns else np.nan
+                'bearing': before['bearing'] if 'bearing' in gps_with_bearing.columns else np.nan
             })
         else:
             # Linear interpolation based on time
@@ -523,7 +503,7 @@ def interpolate_gps_motion(gps_subset, timestamps):
                     'time-string': radar_time_point,
                     'latitude': before['latitude'],
                     'longitude': before['longitude'],
-                    'bearing': before['bearing'] if 'bearing' in gps_sorted.columns else np.nan
+                    'bearing': before['bearing'] if 'bearing' in gps_with_bearing.columns else np.nan
                 })
                 continue
             
@@ -534,7 +514,7 @@ def interpolate_gps_motion(gps_subset, timestamps):
             lon_interp = before['longitude'] + ratio * (after['longitude'] - before['longitude'])
             bearing_interp = (
                 interpolate_bearing(before['bearing'], after['bearing'], ratio)
-                if 'bearing' in gps_sorted.columns
+                if 'bearing' in gps_with_bearing.columns
                 else np.nan
             )
             
@@ -546,7 +526,7 @@ def interpolate_gps_motion(gps_subset, timestamps):
             })
     
     return pd.DataFrame(interpolated_positions)
-
+    
 def imu_to_xytheta(imu_data):
     """
     imu_data: pandas DataFrame with columns angular_velocity_x	angular_velocity_y	angular_velocity_z	linear_acceleration_x	linear_acceleration_y	linear_acceleration_z
@@ -556,9 +536,9 @@ def imu_to_xytheta(imu_data):
         dy:   N array
         dtheta: N array
     """
-    # Time differences between timestamps, expressed in seconds.
-    timestamps = pd.to_datetime(imu_data['timestamp'], errors='coerce').to_numpy(dtype='datetime64[ns]')
-    dt = np.diff(timestamps).astype('timedelta64[ns]').astype(np.float64) / 1e9
+    # time differences beteen the timestamps
+    timestamps = imu_data['timestamp'].values
+    dt = np.diff(timestamps)
     dt = np.append(dt, dt[-1])  # Assume constant dt for the last element
 
     # Extract body-frame acceleration and yaw rate
