@@ -16,7 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
 	sys.path.insert(0, str(PROJECT_ROOT))
 
-from data_association import ICP_registration, registration_from_oriented_points
+from data_association import registration_from_oriented_points
 from descriptors import computing_CFEAR_Features, transform_oriented_points
 from evaluation import (
 	calculate_gps_distance,
@@ -42,7 +42,6 @@ DEFAULT_ODOMETRY_PARAMS = {
 	"stop_if_pos_fault_gt_m": 50.0,
 	"z_percentile": 99.0,
 	"cost_function": "p2p",  # "p2p", "p2l", "p2d"
-	"ICP": False,
 	"window_size": 3,
 	"motion_compensation_flag": True,
 	"iterations": 8,
@@ -62,7 +61,6 @@ PARAM_GRID = {
 	"f_param": [2.0],
 	"z_percentile": [99.5],
 	"cost_function": ["p2p", "p2l"],
-	"ICP": [True, False],
 	"window_size": [3],
 	"motion_compensation_flag": [False],
 	"iterations": [8],
@@ -74,6 +72,17 @@ PARAM_GRID = {
 
 
 def filter_lonely_points(oriented_points, eps=0.5, min_samples=2):
+    """
+    Remove isolated outlier points using DBSCAN clustering.
+    
+    Parameters:
+    - oriented_points: Array of oriented keypoints (Nx4 or Nx5 with x,y coords as first elements)
+    - eps: Max distance between points to be considered neighbors
+    - min_samples: Minimum cluster size to retain points
+    
+    Returns:
+    - filtered_points: Array with lonely points removed
+    """
     if len(oriented_points) == 0:
         return np.array([])
 
@@ -86,6 +95,18 @@ def filter_lonely_points(oriented_points, eps=0.5, min_samples=2):
     return filtered_points
 
 def transform_velocity(velocity_global, heading_deg, gps_to_radar_offset_m=GPS_TO_RADAR_OFFSET_M, gps_to_radar_offset_angle_deg=GPS_TO_RADAR_OFFSET_ANGLE_DEG):
+    """
+    Convert global velocity back into the local sensor frame, applying lever arm corrections.
+    
+    Parameters:
+    - velocity_global: [vx, vy, v_theta]
+    - heading_deg: Heading angle in degrees
+    - gps_to_radar_offset_m: Offset magnitude from GPS center to Radar
+    - gps_to_radar_offset_angle_deg: Offset angle from GPS to Radar
+    
+    Returns:
+    - np.array of [local_vx, local_vy, 0] or corrected local velocity
+    """
     if velocity_global is None or len(velocity_global) != 3:
         return np.array([0.0, 0.0, 0.0])
 
@@ -118,6 +139,18 @@ def transform_velocity(velocity_global, heading_deg, gps_to_radar_offset_m=GPS_T
     return np.array([v_gps_local[0], v_gps_local[1], v_theta_deg])
 
 def estimate_gps(last_longitude, last_latitude, velocity_local, heading, dt):
+    """
+    Project a new GPS coordinate given local moving velocity and time step.
+
+    Parameters:
+    - last_longitude, last_latitude: Previous absolute position
+    - velocity_local: [vx, vy, v_theta] local velocity
+    - heading: Heading/Bearing in degrees
+    - dt: time delta in seconds
+
+    Returns:
+    - gps_longitude, gps_latitude: Next position coordinates
+    """
     # 1. Calculate local translation step [dx_local, dy_local]
     step_local = np.array([velocity_local[0] * dt, velocity_local[1] * dt])
     heading_rad = np.radians(heading)
@@ -140,7 +173,27 @@ def estimate_gps(last_longitude, last_latitude, velocity_local, heading, dt):
     
     return gps_longitude, gps_latitude
 
-def main_odometry(n_images, preprocessing, k, z_percentile, max_distance_percentile, r_param, f_param, cost_function, ICP, window_size, motion_compensation_flag, iterations, every_nth_frame=1, print_lines=False, plot_map=False, smoothing=None, clustering=None, dataset=1, stop_if_pos_fault_gt_m=50.0):
+def main_odometry(n_images, preprocessing, k, z_percentile, max_distance_percentile, r_param, f_param, cost_function, window_size, motion_compensation_flag, iterations, every_nth_frame=1, print_lines=False, plot_map=False, smoothing=None, clustering=None, dataset=1, stop_if_pos_fault_gt_m=50.0):
+    """
+    Main sequence execution loop for evaluating radar odometry on a set of images.
+    
+    This function:
+    1. Loads images and associated GPS tracks.
+    2. Runs feature extraction -> descriptors -> point matching -> minimization iteratively.
+    3. Evaluates error against GPS Ground Truth.
+    4. Supports local velocity estimation and motion compensation.
+    
+    Parameters:
+    - n_images: int, number of images loaded for sequence
+    - preprocessing: str, 'normalized_azimuths', 'cfar'
+    - k, z_percentile, r_param, f_param, cost_function: Settings for CFEAR pipeline components
+    - window_size: Multi-frame window size for multi-scan matching
+    - dataset: which dataset ID to target
+    - stop_if_pos_fault_gt_m: threshold to exit if trajectory completely fails
+    
+    Returns:
+    - odometry_results: pd.DataFrame with estimated path, translation, and velocity columns
+    """
     if dataset == 1:
         dataset_dir = DATA_DIR / "_radar_data_b_scan_image"
     elif dataset == 2:
@@ -320,32 +373,8 @@ def main_odometry(n_images, preprocessing, k, z_percentile, max_distance_percent
             float(odometry_results["translation_y_m"].values[-1]),
         ], dtype=float)
 
-        if ICP:
-            points1 = oriented_points1[:, :2]
-            points2 = oriented_points2[:, :2]
-            points1 = np.hstack((points1, np.zeros((points1.shape[0], 1))))
-            points2 = np.hstack((points2, np.zeros((points2.shape[0], 1))))
-
-            R_prev_1 = R_1_prev.T
-            t_prev_1 = -t_1_prev @ R_1_prev
-            R_f_prev_init = R_prev_1 @ R_1_f
-            t_f_prev_init = t_1_f @ R_prev_1.T + t_prev_1
-
-            transform = ICP_registration(points2, points1, R_init=R_f_prev_init, t_init=t_f_prev_init, distance_threshold=0.2)
-            R_f_prev = transform[:2, :2]
-            t_f_prev = transform[:2, 3]
-
-            R_1_f = R_1_prev @ R_f_prev
-            t_1_f = t_f_prev @ R_1_prev.T + t_1_prev
-
-            theta_rad = np.arctan2(R_1_f[1, 0], R_1_f[0, 0])
-            theta_deg = float(np.degrees(theta_rad))
-            theta_deg = ((theta_deg + heading_offset_deg + 180.0) % 360.0) - 180.0
-            theta_rad = np.radians(theta_deg)
-            if print_lines : print(f"ICP refinement applied. Updated rotation (degrees): {theta_deg:.2f}, translation (meters): ({t_1_f[0]:.2f}, {t_1_f[1]:.2f})")
-        else:
-            R_1_f = R_f_kf 
-            t_1_f = t_f_kf
+        R_1_f = R_f_kf 
+        t_1_f = t_f_kf
 
         oriented_points2_T = transform_oriented_points(oriented_points2, R_1_f, t_1_f)
 
@@ -559,7 +588,6 @@ def run_single_experiment(base_params, overrides, score_column="pos_fault_m", sc
 			r_param=params["r_param"],
 			f_param=params["f_param"],
 			cost_function=params["cost_function"],
-			ICP=params["ICP"],
 			window_size=params["window_size"],
 			motion_compensation_flag=params["motion_compensation_flag"],
 			iterations=params["iterations"],

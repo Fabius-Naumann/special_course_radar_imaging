@@ -114,7 +114,6 @@ def compute_descriptors(img, keypoints, alpha=18, rho=10, max_radius=50):
     
     return np.array(descriptors)
 
-#TODO: Check this implementation
 def estimate_oriented_surface_points(keypoints, r=5.0, f=2.0, min_neighbors=6, 
                                       max_condition_number=1e5, z_min=None, smoothing = None, sigma=1.0):
     """
@@ -303,6 +302,29 @@ def estimate_oriented_surface_points(keypoints, r=5.0, f=2.0, min_neighbors=6,
     return np.asarray(oriented_points, dtype=float), pd
 
 def computing_CFEAR_Features(img, preprocessing, k, z_percentile, max_distance_percentile, velocity, r_param, f_param, motion_compensation_flag=False, smoothing=None):
+    """
+    Execute the entire CFEAR feature extraction pipeline mapping raw images to oriented surface points.
+    
+    Steps:
+    1. Preprocesses the image (Normalization/CFAR).
+    2. Extracts the 'k' strongest points per azimuth above a Z-percentile threshold.
+    3. Motion compensates points (optional).
+    4. Projects keypoints to Cartesian coordinates.
+    5. Smooths and clusters them into oriented points.
+    
+    Parameters:
+    - img: Raw radar image
+    - preprocessing: Preprocessing mode string
+    - k, z_percentile, max_distance_percentile: CFEAR keypoint extraction settings
+    - velocity: (vx, vy, v_theta) of current timestamp for unskewing scans
+    - r_param: Radius for neighborhood searching
+    - f_param: Re-sampling grid size ratio (r_param / f_param)
+    - motion_compensation_flag: Correct polar points before Cartesian conversion
+    - smoothing: Smoothing strategy ('gaussian', 'symmetric', None)
+    
+    Returns:
+    - oriented_points: nx4 array of (x, y, nx, ny)
+    """
     # Step 1: Preprocessing
     if preprocessing in {"normalized_azimuths", "normalized"}:
         img_preprocessed = preprocessing_normalized_azimuths(img)
@@ -348,6 +370,17 @@ def computing_CFEAR_Features(img, preprocessing, k, z_percentile, max_distance_p
     return oriented_points
 
 def transform_oriented_points(oriented_points, R, t):
+    """
+    Transform oriented points across coordinates given rigid body operations.
+    
+    Parameters:
+    - oriented_points: nx4 array (x, y, nx, ny)
+    - R: 2x2 rotation matrix
+    - t: 2-element translation vector
+    
+    Returns:
+    - oriented_points_transformed: nx4 array representing the transformed geometry
+    """
     # Apply rotation and translation to the point coordinates
     points = oriented_points[:, :2]  # Extract point coordinates (x, y)
     normals = oriented_points[:, 2:]  # Extract normal vectors (nx, ny)
@@ -359,21 +392,6 @@ def transform_oriented_points(oriented_points, R, t):
     # Combine transformed points and normals back into the oriented points format
     oriented_points_transformed = np.hstack((points_transformed, normals_transformed))
     return oriented_points_transformed
-
-def orb_descriptor(img, keypoints):
-    """
-    Compute ORB descriptors for given keypoints in the radar image.
-    """
-    # Convert keypoints to OpenCV format
-    cv_keypoints = [cv2.KeyPoint(float(kp[1]), float(kp[0]), 1) for kp in keypoints]
-    
-    # Create ORB descriptor extractor
-    orb = cv2.ORB_create()
-    
-    # Compute descriptors
-    _, descriptors = orb.compute(img.astype(np.uint8), cv_keypoints)
-    
-    return descriptors
 
 def radial_statistics_descriptor(keypoints, M:int=8, eps=1e-12):
     """

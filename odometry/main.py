@@ -8,17 +8,16 @@ if str(project_root) not in sys.path:
     
 from utils.data_loading import load_radar_images, load_gps_data, extract_timestamp
 from keypoint_extraction import compute_H_S, Cen2019_keypoints, k_strongest_keypoints
-from descriptors import compute_descriptors, estimate_oriented_surface_points, orb_descriptor, radial_statistics_descriptor
+from descriptors import compute_descriptors, estimate_oriented_surface_points
 from data_association import (
     unaryMatchesFromDescriptors,
     compute_pairwiseCompatibilityScore, select_matches,
     registration_from_oriented_points
 )
-from evaluation import calculate_gt_motion, map_gps, interpolate_gps_motion, create_stabilized_overlay_video
+from evaluation import calculate_gt_motion, map_gps, interpolate_gps_motion
 from motion_estimation import (
     motion_estimation_ransac,
-    motion_estimation_SVD,
-    motion_estimation_bundle_adjustment,
+    motion_estimation_SVD
 )
 import numpy as np
 import os
@@ -30,11 +29,9 @@ l_max = 300  # maximum number of keypoints
 r_param = 5.0  # radius for surface point estimation (meters)
 f_param = 1.0  # downsampling factor for oriented points
 n_images = 15  # number of radar images to process
-DESCRIPTOR_TYPE = "cen2019"  # Options: "cen2019", "orb", "radial"
-KEYPOINT_TYPE = "cen2019"  # Options: "cen2019", "k_strongest", "blob", "orb"
+DESCRIPTOR_TYPE = "cen2019"  # Options: "cen2019"
+KEYPOINT_TYPE = "cen2019"  # Options: "cen2019"
 
-
-#TODO: Change into notbook and clean up code structure
 def build_descriptors(img, keypoints, descriptor_type):
     """
     Build descriptors for keypoints and return aligned (keypoints, descriptors).
@@ -49,20 +46,9 @@ def build_descriptors(img, keypoints, descriptor_type):
         descriptors = np.asarray(compute_descriptors(img, keypoints), dtype=float)
         return keypoints, descriptors
 
-    if mode == "orb":
-        descriptors, valid_indices = orb_descriptor(img, keypoints)
-        if valid_indices.size == 0:
-            return np.empty((0, 2), dtype=float), np.empty((0, 32), dtype=float)
-        return keypoints[valid_indices], np.asarray(descriptors, dtype=float)
-
-    if mode in ("radial", "radial_statistics", "rsd"):
-        descriptors = radial_statistics_descriptor(keypoints)
-        descriptors = np.asarray(descriptors, dtype=float).reshape(len(keypoints), -1)
-        return keypoints, descriptors
-
     raise ValueError(
         f"Unsupported DESCRIPTOR_TYPE='{descriptor_type}'. "
-        "Use one of: 'cen2019', 'orb', 'radial'."
+        "Use one of: 'cen2019'."
     )
 
 if __name__ == "__main__":
@@ -269,15 +255,6 @@ if __name__ == "__main__":
     )
     results_df.to_csv(os.path.join(output_dir, "odometry_results.csv"), index=False)
     print(f"Saved odometry estimates to {os.path.join(output_dir, 'odometry_results.npz')} and {os.path.join(output_dir, 'odometry_results.csv')}")
-
-    print("Generating stabilized transformed overlay video...")
-    create_stabilized_overlay_video(
-        images=images,
-        rotations_deg=rot,
-        translations=trans,
-        output_file=os.path.join(output_dir, "transformed_overlay.mp4"),
-        fps=8,
-    )
 
     print("Generating GPS comparison map...")
     map_gps(gps_data, trans, timestamps, odo_rotations_deg=rot)

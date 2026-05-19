@@ -1,7 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.sparse.linalg import eigs
-import open3d as o3d
 
 import sys
 from pathlib import Path
@@ -15,28 +14,10 @@ from utils.data_loading import load_radar_images, polar_to_cartesian_image, pola
 from keypoint_extraction import compute_H_S, Cen2019_keypoints, visualize_keypoints
 from descriptors import compute_descriptors
 
-def ICP_registration(points1, points2, max_iterations=20, distance_threshold=0.5, R_init=np.eye(2), t_init=np.zeros(2)):
-    # Create Open3D point clouds
-    pcd1 = o3d.geometry.PointCloud()
-    pcd2 = o3d.geometry.PointCloud()
-    pcd1.points = o3d.utility.Vector3dVector(points1)
-    pcd2.points = o3d.utility.Vector3dVector(points2)
-
-    # Convert 2D transformation to 4x4 homogeneous transformation matrix for Open3D
-    R = R_init
-    t = t_init
-    transformation_init = np.eye(4, dtype=float)
-    transformation_init[:2, :2] = R
-    transformation_init[:2, 3] = t
-
-    # Initial alignment using Open3D's ICP
-    threshold = distance_threshold
-    reg = o3d.pipelines.registration.registration_icp(pcd1, pcd2, threshold, transformation_init, o3d.pipelines.registration.TransformationEstimationPointToPoint(), o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=max_iterations))
-    return reg.transformation
-
 def unaryMatchesFromDescriptors(desc1, desc2):
     """
     Compute unary matches between two sets of descriptors
+
     
     Parameters:
     -----------
@@ -398,32 +379,31 @@ def _register_pair_cfear(
             p_feat2 = (float(eigvals2[0]), float(eigvals2[1]))
             
             # Compute residual based on cost function (equations 12-14)
-            match cost_function:
-                case "p2p":
-                    residual = point_to_point_cost(mu1, mu2, np.array([[c, -s], [s, c]]), t)
-                    # Jacobian for P2P
-                    mu1_t = np.array([c * mu1[0] - s * mu1[1], s * mu1[0] + c * mu1[1]]) + t
-                    error_vec = mu1_t - mu2
-                    error_norm_sq = np.sum(error_vec**2) + 1e-12
-                    error_norm = np.sqrt(error_norm_sq)
-                    dR_dtheta_mu = np.array([-s * mu1[0] - c * mu1[1], c * mu1[0] - s * mu1[1]])
-                    J = np.array([
-                        2 * error_vec[0] / error_norm,
-                        2 * error_vec[1] / error_norm,
-                        2 * float(np.dot(error_vec, dR_dtheta_mu)) / error_norm
-                    ], dtype=float)
-                case "p2l":
-                    residual = point_to_line_cost(mu1, mu2, n2, np.array([[c, -s], [s, c]]), t)
-                    # Jacobian for P2L
-                    dR_dtheta_mu = np.array([-s * mu1[0] - c * mu1[1], c * mu1[0] - s * mu1[1]])
-                    J = np.array([n2[0], n2[1], float(np.dot(n2, dR_dtheta_mu))], dtype=float)
-                case "p2d":
-                    residual = point_to_distribution_cost(mu1, mu2, sigma2, np.array([[c, -s], [s, c]]), t)
-                    # Jacobian for P2D
-                    dR_dtheta_mu = np.array([-s * mu1[0] - c * mu1[1], c * mu1[0] - s * mu1[1]])
-                    J = np.array([n2[0], n2[1], float(np.dot(n2, dR_dtheta_mu))], dtype=float)
-                case _:
-                    raise ValueError(f"Unknown cost_function: {cost_function}")
+            if cost_function == "p2p":
+                residual = point_to_point_cost(mu1, mu2, np.array([[c, -s], [s, c]]), t)
+                # Jacobian for P2P
+                mu1_t = np.array([c * mu1[0] - s * mu1[1], s * mu1[0] + c * mu1[1]]) + t
+                error_vec = mu1_t - mu2
+                error_norm_sq = np.sum(error_vec**2) + 1e-12
+                error_norm = np.sqrt(error_norm_sq)
+                dR_dtheta_mu = np.array([-s * mu1[0] - c * mu1[1], c * mu1[0] - s * mu1[1]])
+                J = np.array([
+                    2 * error_vec[0] / error_norm,
+                    2 * error_vec[1] / error_norm,
+                    2 * float(np.dot(error_vec, dR_dtheta_mu)) / error_norm
+                ], dtype=float)
+            elif cost_function == "p2l":
+                residual = point_to_line_cost(mu1, mu2, n2, np.array([[c, -s], [s, c]]), t)
+                # Jacobian for P2L
+                dR_dtheta_mu = np.array([-s * mu1[0] - c * mu1[1], c * mu1[0] - s * mu1[1]])
+                J = np.array([n2[0], n2[1], float(np.dot(n2, dR_dtheta_mu))], dtype=float)
+            elif cost_function == "p2d":
+                residual = point_to_distribution_cost(mu1, mu2, sigma2, np.array([[c, -s], [s, c]]), t)
+                # Jacobian for P2D
+                dR_dtheta_mu = np.array([-s * mu1[0] - c * mu1[1], c * mu1[0] - s * mu1[1]])
+                J = np.array([n2[0], n2[1], float(np.dot(n2, dR_dtheta_mu))], dtype=float)
+            else:
+                raise ValueError(f"Unknown cost_function: {cost_function}")
 
             # Apply Huber loss as weight
             huber_weight = Huber_loss(residual, huber_delta)
@@ -586,32 +566,31 @@ def _build_cfear_normal_equations(
         eigvals2 = eigvals2_list[j]
         p_feat2 = (float(eigvals2[0]), float(eigvals2[1]))
 
-        match cost_function:
-            case "p2p":
-                residual = point_to_point_cost(mu1, mu2, R_theta, t)
-                mu1_t = np.array([c * mu1[0] - s * mu1[1], s * mu1[0] + c * mu1[1]]) + t
-                error_vec = mu1_t - mu2
-                error_norm_sq = np.sum(error_vec**2) + 1e-12
-                error_norm = np.sqrt(error_norm_sq)
-                dR_dtheta_mu = np.array([-s * mu1[0] - c * mu1[1], c * mu1[0] - s * mu1[1]])
-                J = np.array(
-                    [
-                        2 * error_vec[0] / error_norm,
-                        2 * error_vec[1] / error_norm,
-                        2 * float(np.dot(error_vec, dR_dtheta_mu)) / error_norm,
-                    ],
-                    dtype=float,
-                )
-            case "p2l":
-                residual = point_to_line_cost(mu1, mu2, n2, R_theta, t)
-                dR_dtheta_mu = np.array([-s * mu1[0] - c * mu1[1], c * mu1[0] - s * mu1[1]])
-                J = np.array([n2[0], n2[1], float(np.dot(n2, dR_dtheta_mu))], dtype=float)
-            case "p2d":
-                residual = point_to_distribution_cost(mu1, mu2, sigma2, R_theta, t)
-                dR_dtheta_mu = np.array([-s * mu1[0] - c * mu1[1], c * mu1[0] - s * mu1[1]])
-                J = np.array([n2[0], n2[1], float(np.dot(n2, dR_dtheta_mu))], dtype=float)
-            case _:
-                raise ValueError(f"Unknown cost_function: {cost_function}")
+        if cost_function == "p2p":
+            residual = point_to_point_cost(mu1, mu2, R_theta, t)
+            mu1_t = np.array([c * mu1[0] - s * mu1[1], s * mu1[0] + c * mu1[1]]) + t
+            error_vec = mu1_t - mu2
+            error_norm_sq = np.sum(error_vec**2) + 1e-12
+            error_norm = np.sqrt(error_norm_sq)
+            dR_dtheta_mu = np.array([-s * mu1[0] - c * mu1[1], c * mu1[0] - s * mu1[1]])
+            J = np.array(
+                [
+                    2 * error_vec[0] / error_norm,
+                    2 * error_vec[1] / error_norm,
+                    2 * float(np.dot(error_vec, dR_dtheta_mu)) / error_norm,
+                ],
+                dtype=float,
+            )
+        elif cost_function == "p2l":
+            residual = point_to_line_cost(mu1, mu2, n2, R_theta, t)
+            dR_dtheta_mu = np.array([-s * mu1[0] - c * mu1[1], c * mu1[0] - s * mu1[1]])
+            J = np.array([n2[0], n2[1], float(np.dot(n2, dR_dtheta_mu))], dtype=float)
+        elif cost_function == "p2d":
+            residual = point_to_distribution_cost(mu1, mu2, sigma2, R_theta, t)
+            dR_dtheta_mu = np.array([-s * mu1[0] - c * mu1[1], c * mu1[0] - s * mu1[1]])
+            J = np.array([n2[0], n2[1], float(np.dot(n2, dR_dtheta_mu))], dtype=float)
+        else:
+            raise ValueError(f"Unknown cost_function: {cost_function}")
 
         huber_weight = Huber_loss(residual, huber_delta)
         eigvals1 = np.linalg.eigvalsh(_covariance_from_normal(n1))

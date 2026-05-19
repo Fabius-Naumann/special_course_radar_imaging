@@ -91,40 +91,6 @@ def motion_estimation_SVD(matches, kp1, kp2):
 
     return R, t
 
-
-# GNC
-
-# Windowed Bundle Adjustment
-def motion_estimation_bundle_adjustment(matches, kp, prev_trans, prev_rot, method = "RANSAC"):
-    """
-    Refine motion estimation using bundle adjustment.
-    
-    Parameters:
-    - matches: List of matched keypoint indices for the current image with n previous images (from data association)
-    - kp: (n+1) Keypoints from the current image and the n previous images (Nx2 array of (angle, range))
-    - method: motion estimation method ("RANSAC" or "SVD")
-    - max_iterations: Maximum number of optimization iterations
-    - tolerance: Convergence threshold for optimization
-    
-    Returns:
-    - refined_R: Refined rotation matrix
-    - refined_t: Refined translation vector
-    """
-    n = len(matches)  # Number of previous images
-
-    # Initialization
-    kp1 = kp[0]  # Keypoints from the current image
-    kp_prev = kp[1:]  # Keypoints from the n previous images
-
-    if method == "RANSAC":
-        initial_theta, initial_t, _, _, _ = motion_estimation_ransac(matches[0], kp1, kp_prev[0])
-        theta = np.radians(float(initial_theta))
-        t = np.array(initial_t, dtype=float).ravel().copy()
-    else:  # SVD
-        initial_R, initial_t = motion_estimation_SVD(matches[0], kp1, kp_prev[0])
-
-    # Windowed Bundle Adjustment
-    pass
     
 
     
